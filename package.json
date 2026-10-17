@@ -1,0 +1,27 @@
+{
+  "name": "@dardt/pi-mesh",
+  "version": "0.1.0",
+  "description": "Local messaging and discovery between independent Pi sessions",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dardT/pi-mesh.git"
+  },
+  "homepage": "https://github.com/dardT/pi-mesh#readme",
+  "bugs": "https://github.com/dardT/pi-mesh/issues",
+  "keywords": ["pi-package", "pi-extension", "session-messaging"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["index.ts", "catalog.ts", "README.md", "LICENSE"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

@@ -1,6 +1,14 @@
 # Pi Mesh
 
-Local communication and discovery between Pi processes owned by the same OS user. Load from `~/.pi/agent/extensions/pi-mesh/`; run `/reload` in existing Pi sessions after an update.
+Local communication and discovery between Pi processes owned by the same OS user.
+
+Install as a Pi package from GitHub:
+
+```sh
+pi install git:github.com/dardT/pi-mesh
+```
+
+Run `/reload` in existing Pi sessions after installing or updating. Remove any previously installed standalone copy before installing the package to avoid loading the extension twice. The manifest declares `@dardt/pi-mesh` for a future npm release; it is **not published to npm yet**.
 
 ## Commands
 
