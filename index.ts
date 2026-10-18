@@ -150,6 +150,7 @@ export default function (pi: ExtensionAPI) {
   let catalog = createCatalog(selfId);
   let refreshRun = 0;
   let server: Server | undefined;
+  let member = false;
   let listenerId: string | undefined;
   let steerActive: Job | undefined;
   let lastAnswer: Response | undefined;
@@ -161,7 +162,19 @@ export default function (pi: ExtensionAPI) {
   const requests = createRequestTracker();
   const sockets = new Set<Socket>();
 
+  async function setSessionIdentity(ctx: ExtensionContext) {
+    const id = `s${createHash("sha256").update(ctx.sessionManager.getSessionId()).digest("hex").slice(0, 15)}`;
+    if (id === selfId) return;
+    if (member) {
+      await stop(ctx);
+      for (const request of requests.list()) requests.dismiss(request.id);
+    }
+    selfId = id;
+    catalog = createCatalog(id);
+  }
+
   async function announce(ctx: ExtensionContext) {
+    if (!member) return;
     const activity = btwRunning ? "answering-btw" : steerActive || !ctx.isIdle() ? "busy" : "idle";
     await catalog.announce(ctx, !!server, activity, btwQueue.length);
   }
@@ -197,6 +210,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function stop(ctx: ExtensionContext) {
+    member = false;
+    ++refreshRun;
+    ctx.ui.setStatus("pi-mesh-refresh", undefined);
     const oldServer = server;
     const oldId = listenerId;
     server = undefined;
@@ -212,11 +228,11 @@ export default function (pi: ExtensionAPI) {
     for (const socket of sockets) socket.destroy();
     oldServer?.close();
     if (oldId) await unlink(socketPath(oldId)).catch(() => {});
-    await announce(ctx);
+    await catalog.withdraw();
   }
 
   async function listen(id: string, ctx: ExtensionContext) {
-    if (server) throw new Error(`Already listening as ${listenerId}; run /mesh:listen off first`);
+    if (server) throw new Error(`Already in the mesh as ${listenerId}; run /mesh off first`);
     if (id === "ws") throw new Error("ID ws is reserved for workspace refresh");
     const path = socketPath(id);
     await secureDirectory();
@@ -303,23 +319,12 @@ export default function (pi: ExtensionAPI) {
       await chmod(path, 0o600);
     } catch (error) { next.close(); throw error; }
     server = next;
+    member = true;
     listenerId = id;
     listenerContext = ctx;
     ctx.ui.setStatus("pi-mesh", `listening: ${id}`);
     try { await announce(ctx); }
     catch (error) { await stop(ctx); throw error; }
-  }
-
-  async function renameId(id: string, ctx: ExtensionContext) {
-    if (id === selfId) return;
-    if (id === "ws") throw new Error("ID ws is reserved for workspace refresh");
-    socketPath(id);
-    const old = catalog;
-    const replacement = createCatalog(id);
-    await replacement.announce(ctx, false);
-    catalog = replacement;
-    selfId = id;
-    await old.withdraw();
   }
 
   async function targetCompletions(prefix: string, options: { delayed?: boolean; workspace?: boolean; listeningOnly?: boolean; includeSelf?: boolean } = {}) {
@@ -340,25 +345,30 @@ export default function (pi: ExtensionAPI) {
     return items.length ? items : null;
   }
 
+  function requireMembership() {
+    if (!member) throw new Error("Outside the mesh; run /mesh on first");
+  }
+
   function updateTracked(requestId: string, response: Response) {
     if (response.status === "done") requests.mark(requestId, "done", response.text);
     else if (response.status === "error") requests.mark(requestId, "error", response.error);
   }
 
   async function waitFor(target: string, requestId: string, signal?: AbortSignal) {
+    requireMembership();
     const response = await exchange(target, { action: "wait", requestId }, signal);
     updateTracked(requestId, response);
     return response;
   }
 
-  async function cancelTracked(requestId: string): Promise<string> {
+  async function cancelTracked(requestId: string, signal?: AbortSignal): Promise<string> {
     const record = requests.get(requestId);
     if (!record) throw new Error(`Unknown tracked request: ${requestId}`);
     let outcome: string;
     if (record.state !== "pending") outcome = "Completed request dismissed locally";
     else {
       try {
-        const response = await exchange(record.target, { action: "cancel", requestId, from: record.sender });
+        const response = await exchange(record.target, { action: "cancel", requestId, from: record.sender }, signal);
         outcome = response.status === "done" ? response.text : `Dismissed locally; target did not cancel: ${response.status === "error" ? response.error : "still pending"}`;
       } catch (error) { outcome = `Dismissed locally; target cancellation unavailable: ${error instanceof Error ? error.message : String(error)}`; }
     }
@@ -374,10 +384,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function purposeFor(peer: PeerRecord): Promise<string> {
+    requireMembership();
     const response = await exchange(peer.id, { action: "send", kind: "btw", from: selfId, text: PURPOSE_PROMPT, delayed: false });
     return describe(response).trim();
   }
 
+  pi.on("session_start", async (_event, ctx) => { await setSessionIdentity(ctx); });
   pi.on("agent_start", (_event, ctx) => { void announce(ctx).catch(() => {}); });
   pi.on("agent_end", (event) => {
     if (!steerActive) return;
@@ -397,35 +409,42 @@ export default function (pi: ExtensionAPI) {
     void announce(ctx).catch(() => {});
     scheduleBtw();
   });
-  pi.on("session_start", async (_event, ctx) => {
-    try { await announce(ctx); }
-    catch (error) { ctx.ui.notify(`Pi Herdr Mesh: ${error}`, "error"); }
-  });
   pi.on("session_info_changed", (_event, ctx) => { void announce(ctx).catch(() => {}); });
   pi.on("session_shutdown", async (_event, ctx) => {
     ++refreshRun;
     ctx.ui.setStatus("pi-mesh-refresh", undefined);
     await stop(ctx);
     for (const request of requests.list()) requests.dismiss(request.id);
-    await catalog.withdraw();
   });
 
-  pi.registerCommand("mesh:listen", {
-    description: "Opt in to incoming requests; /mesh:listen [id] or /mesh:listen off",
+  pi.registerCommand("mesh", {
+    description: "Join the mesh (/mesh or /mesh on), leave (/mesh off), or inspect membership (/mesh status)",
+    getArgumentCompletions: (prefix) => {
+      const actions = ["on", "off", "status"].filter((action) => action.startsWith(prefix));
+      return actions.length ? actions.map((action) => ({ value: action, label: action })) : null;
+    },
     handler: async (args, ctx) => {
       try {
-        const id = args.trim();
-        if (id === "off") {
-          if (!server) return ctx.ui.notify("Not listening", "warning");
-          await stop(ctx);
-          ctx.ui.notify("Stopped listening", "info");
-        } else {
-          if (id.includes(" ")) throw new Error("Usage: /mesh:listen [id] or /mesh:listen off");
-          if (server) throw new Error(`Already listening as ${listenerId}; run /mesh:listen off first`);
-          if (id) await renameId(id, ctx);
+        await setSessionIdentity(ctx);
+        const action = args.trim() || "on";
+        if (action === "on") {
+          if (member) return ctx.ui.notify(`Already in the mesh as ${selfId}`, "info");
           await listen(selfId, ctx);
-          ctx.ui.notify(`Listening as ${selfId}`, "info");
-        }
+          ctx.ui.notify(`Joined the mesh as ${selfId}`, "info");
+        } else if (action === "off") {
+          if (!member) return ctx.ui.notify("Already outside the mesh", "info");
+          await stop(ctx);
+          const pendingBtw = requests.list().filter((request) => request.state === "pending" && request.kind === "btw");
+          await Promise.allSettled(pendingBtw.map(async (request) => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 2_000);
+            try { await cancelTracked(request.id, controller.signal); }
+            finally { clearTimeout(timer); }
+          }));
+          for (const request of requests.list()) requests.dismiss(request.id);
+          ctx.ui.notify(`Left the mesh${pendingBtw.length ? `; attempted to cancel ${pendingBtw.length} pending BTW request(s). Started work cannot be undone.` : ""}`, "info");
+        } else if (action === "status") ctx.ui.notify(member ? `In the mesh as ${selfId} (listening)` : "Outside the mesh", "info");
+        else throw new Error("Usage: /mesh [on|off|status]");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
   });
@@ -441,6 +460,7 @@ export default function (pi: ExtensionAPI) {
           const value = delayed ? input.slice(10).trim() : input;
           const match = value.match(/^(\S+)\s+([\s\S]+)$/);
           if (!match) throw new Error(`Usage: /mesh:${kind} [--delayed] <id> <text>`);
+          requireMembership();
           const sender = selfId;
           const response = await exchange(match[1], { action: "send", kind, from: sender, text: match[2], delayed });
           if (response.status === "pending") requests.track(response.requestId, match[1], kind, sender);
@@ -452,10 +472,11 @@ export default function (pi: ExtensionAPI) {
       name: `mesh_${kind}`,
       label: `${kind === "steer" ? "Steer" : "Ask BTW"} Pi session`,
       description: kind === "steer"
-        ? "Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer."
-        : "Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
+        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer."
+        : "Requires the caller to join with /mesh on. Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
       parameters: Type.Object({ id: Type.String(), text: Type.String(), delayed: Type.Optional(Type.Boolean()) }),
       async execute(_callId, args, signal) {
+        requireMembership();
         const sender = selfId;
         const response = await exchange(args.id, { action: "send", kind, from: sender, text: args.text, delayed: args.delayed ?? false }, signal);
         if (response.status === "pending") requests.track(response.requestId, args.id, kind, sender);
@@ -479,7 +500,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "mesh_wait",
     label: "Wait for Pi Herdr Mesh request",
-    description: "Wait up to 30 seconds for a delayed mesh_steer or mesh_btw request; returns the reply or pending status.",
+    description: "While joined to the mesh, wait up to 30 seconds for a delayed mesh_steer or mesh_btw request; returns the reply or pending status.",
     parameters: Type.Object({ id: Type.String(), requestId: Type.String() }),
     async execute(_callId, args, signal) {
       const response = await waitFor(args.id, args.requestId, signal);
@@ -534,6 +555,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const id = args.trim();
         if (!id || /\s/.test(id)) throw new Error("Usage: /mesh:cancel <request-id>");
+        requireMembership();
         ctx.ui.notify(await cancelTracked(id), "info");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
@@ -553,9 +575,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "mesh_cancel",
     label: "Cancel or dismiss delayed mesh request",
-    description: "Cancel a queued BTW at the target if it has not started. Running BTW or steer cannot be undone: dismiss local tracking only. Uses the request ID returned by a delayed send.",
+    description: "While joined to the mesh, cancel a queued BTW at the target if it has not started. Running BTW or steer cannot be undone: dismiss local tracking only. Uses the request ID returned by a delayed send.",
     parameters: Type.Object({ requestId: Type.String() }),
     async execute(_callId, args) {
+      requireMembership();
       return { content: [{ type: "text", text: await cancelTracked(args.requestId) }], details: {} };
     },
   });
@@ -579,6 +602,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const run = ++refreshRun;
       try {
+        requireMembership();
         const scope = catalogScope(args);
         const workspaceKey = scope === "ws" ? herdrWorkspaceKey() : undefined;
         if (scope === "ws" && !workspaceKey) throw new Error("Workspace refresh requires a Herdr-managed pane");
