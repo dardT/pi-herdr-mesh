@@ -8,6 +8,7 @@ import { buildSessionContext, convertToLlm, type ExtensionAPI, type ExtensionCon
 import { Box, Text } from "@earendil-works/pi-tui";
 import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js";
 import { createRequestTracker, type RequestRecord } from "./requests.js";
+import { clearMetadataMatch, rankPeers } from "./routing.js";
 
 const WAIT_MS = 30_000;
 const MAX_BYTES = 1024 * 1024;
@@ -187,6 +188,7 @@ export default function (pi: ExtensionAPI) {
   const pendingPrompts = new Map<string, string>();
   const watches = new Map<string, AbortController>();
   const sockets = new Set<Socket>();
+  const purposeQueries = new Map<string, Promise<string>>();
 
   async function setSessionIdentity(ctx: ExtensionContext) {
     const id = `s${createHash("sha256").update(ctx.sessionManager.getSessionId()).digest("hex").slice(0, 15)}`;
@@ -501,8 +503,16 @@ export default function (pi: ExtensionAPI) {
 
   async function purposeFor(peer: PeerRecord): Promise<string> {
     requireMembership();
-    const response = await exchange(peer.id, { action: "send", kind: "btw", from: selfId, text: PURPOSE_PROMPT, delayed: false });
-    return describe(response).trim();
+    const key = `${peer.id}:${peer.pid}:${peer.revision}`;
+    const existing = purposeQueries.get(key);
+    if (existing) return existing;
+    const query = (async () => {
+      const response = await exchange(peer.id, { action: "send", kind: "btw", from: selfId, text: PURPOSE_PROMPT, delayed: false });
+      return describe(response).trim();
+    })();
+    purposeQueries.set(key, query);
+    try { return await query; }
+    finally { if (purposeQueries.get(key) === query) purposeQueries.delete(key); }
   }
 
   function finishSteer(result: Response) {
@@ -849,6 +859,57 @@ export default function (pi: ExtensionAPI) {
         if (failures.length) ctx.ui.notify(`Purpose refresh failed (will retry): ${failures.join("; ")}`, "warning");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
       finally { if (ctx.mode === "tui" && run === refreshRun) ctx.ui.setStatus("pi-mesh-refresh", undefined); }
+    },
+  });
+  pi.registerTool({
+    name: "mesh_find",
+    label: "Find a mesh recipient",
+    description: "Find a recipient for a task-based steer or BTW. Reads live members in this Herdr workspace first (or all with all: true), widens when nothing matches, and refreshes at most three stale purposes when metadata cannot identify a recipient. Returns candidates and freshness, not an automatic selection. For an explicit ID, use mesh_steer or mesh_btw directly. Requires /mesh on to refresh purposes.",
+    parameters: Type.Object({ query: Type.String({ description: "Task, name, folder, or other clues for the recipient" }), all: Type.Optional(Type.Boolean({ description: "Search all same-user workspaces immediately" })) }),
+    async execute(_callId, args) {
+      requireMembership();
+      if (!args.query.trim()) throw new Error("Provide a recipient description");
+      const workspaceKey = args.all ? undefined : herdrWorkspaceKey();
+      const peers = (await catalog.list()).filter((peer) => peer.listening && peer.id !== selfId);
+      let scope = workspaceKey ? "current Herdr workspace" : "all local sessions";
+      let candidates = workspaceKey ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : peers;
+      const refreshed: string[] = [];
+      const refreshErrors: string[] = [];
+      async function refreshShortlist() {
+        const ranked = rankPeers(candidates, args.query);
+        if (clearMetadataMatch(ranked, args.query)) return;
+        for (const { peer, fresh } of ranked) {
+          if (fresh || refreshed.includes(peer.id) || refreshed.length >= 3) continue;
+          refreshed.push(peer.id);
+          // catalog.refresh retains the previous purpose on failure; capture errors for the caller.
+          await catalog.refresh(peer.id, async (current) => {
+            try { return await purposeFor(current); }
+            catch (error) { refreshErrors.push(`${current.id}: ${error instanceof Error ? error.message : String(error)}`); throw error; }
+          });
+        }
+      }
+      await refreshShortlist();
+      let latest = (await catalog.list()).filter((peer) => candidates.some((candidate) => candidate.id === peer.id));
+      if (workspaceKey && !rankPeers(latest, args.query).some((candidate) => candidate.score > 0)) {
+        candidates = peers;
+        scope = "all local sessions (no workspace match)";
+        await refreshShortlist();
+        latest = (await catalog.list()).filter((peer) => candidates.some((candidate) => candidate.id === peer.id));
+      }
+      const results = rankPeers(latest, args.query);
+      const remaining = results.filter(({ fresh, peer }) => !fresh && !refreshed.includes(peer.id)).length;
+      const lines = results.slice(0, 20).map(({ peer, score, fresh }) =>
+        `${peer.id}${peer.name ? ` — ${peer.name}` : ""} · ${peer.activity} · ${peer.cwd}${peer.branch ? ` [${peer.branch}]` : ""}\n  Purpose (${fresh ? "current" : peer.purpose ? "stale" : "unknown"}): ${peer.purpose ?? "not refreshed"}${score ? ` · match score ${score}` : ""}`);
+      const text = [
+        `Recipient candidates · ${scope} · ${results.length} listening`,
+        ...lines,
+        results.length > 20 ? `${results.length - 20} more candidates not shown; narrow the query or use mesh_catalog.` : "",
+        remaining && refreshed.length >= 3 ? `${remaining} stale candidates not refreshed (three-query limit). Narrow the query or ask the user if routing remains ambiguous.` : "",
+        refreshErrors.length ? `Purpose refresh failed: ${refreshErrors.join("; ")}` : "",
+        !results.length ? "No listening member found. The target must load the extension and join with /mesh on." : "",
+        "Choose a recipient only if the evidence is clear; otherwise ask the user. Purpose queries are model calls on the target.",
+      ].filter(Boolean).join("\n\n");
+      return { content: [{ type: "text", text }], details: { scope, refreshed, candidates: results.map(({ peer, score, fresh }) => ({ id: peer.id, score, purposeFresh: fresh })) } };
     },
   });
   pi.registerTool({
