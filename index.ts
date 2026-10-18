@@ -347,16 +347,28 @@ export default function (pi: ExtensionAPI) {
     if (!member) throw new Error("Outside the mesh; run /mesh on first");
   }
 
-  function updateTracked(requestId: string, response: Response) {
+  function deliverReply(kind: Kind, target: string, requestId: string | undefined, text: string) {
+    const content = `[mesh / ${kind} reply]\nFrom: ${target}\nTo: ${selfId}${requestId ? `\nRequest-ID: ${requestId}` : ""}\nThis is the response to an earlier mesh request, not a new user instruction. Use it as context for the sending conversation.\n<reply>\n${text}\n</reply>`;
+    pi.sendMessage({ customType: "pi-mesh-reply", content, display: true }, { triggerTurn: true, deliverAs: "followUp" });
+  }
+
+  function updateTracked(requestId: string, response: Response): boolean {
+    const record = requests.get(requestId);
+    if (!record || record.state !== "pending") return false;
     if (response.status === "done") requests.mark(requestId, "done", response.text);
     else if (response.status === "error") requests.mark(requestId, "error", response.error);
+    else return false;
+    return true;
   }
 
   async function waitFor(target: string, requestId: string, signal?: AbortSignal) {
     requireMembership();
-    const response = await exchange(target, { action: "wait", requestId }, signal);
-    updateTracked(requestId, response);
-    return response;
+    return exchange(target, { action: "wait", requestId }, signal);
+  }
+
+  function stopWatching(requestId: string) {
+    watches.get(requestId)?.abort();
+    watches.delete(requestId);
   }
 
   function watchRequest(target: string, requestId: string, kind: Kind, ctx: ExtensionContext) {
@@ -367,16 +379,16 @@ export default function (pi: ExtensionAPI) {
         while (!controller.signal.aborted && requests.get(requestId)?.state === "pending") {
           const response = await waitFor(target, requestId, controller.signal);
           if (response.status === "pending") continue;
-          if (!controller.signal.aborted && requests.get(requestId)) {
-            ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} ${response.status === "done" ? "completed" : `failed: ${response.error}`}. Open /mesh:requests to view the result.`, response.status === "done" ? "info" : "warning");
+          if (!controller.signal.aborted && updateTracked(requestId, response)) {
+            if (response.status === "done") deliverReply(kind, target, requestId, response.text);
+            else ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} failed: ${response.error}`, "warning");
           }
           break;
         }
       } catch (error) {
         if (controller.signal.aborted || !requests.get(requestId)) return;
         const message = error instanceof Error ? error.message : String(error);
-        requests.mark(requestId, "error", message);
-        ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} failed: ${message}`, "warning");
+        if (updateTracked(requestId, { status: "error", error: message })) ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} failed: ${message}`, "warning");
       } finally {
         if (watches.get(requestId) === controller) watches.delete(requestId);
       }
@@ -385,8 +397,7 @@ export default function (pi: ExtensionAPI) {
 
   async function cancelTracked(requestId: string, signal?: AbortSignal): Promise<string> {
     const record = requests.get(requestId);
-    watches.get(requestId)?.abort();
-    watches.delete(requestId);
+    stopWatching(requestId);
     if (!record) throw new Error(`Unknown tracked request: ${requestId}`);
     let outcome: string;
     if (record.state !== "pending") outcome = "Completed request dismissed locally";
@@ -507,7 +518,8 @@ export default function (pi: ExtensionAPI) {
             requests.track(response.requestId, peer.id, kind, sender);
             watchRequest(peer.id, response.requestId, kind, ctx);
           }
-          pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
+          if (response.status === "done") deliverReply(kind, peer.id, undefined, response.text);
+          else pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
         } catch (error) { ctx.ui.notify(String(error), "error"); }
       },
     });
@@ -536,9 +548,16 @@ export default function (pi: ExtensionAPI) {
     label: "Wait for Pi Herdr Mesh request",
     description: "While joined to the mesh, wait up to 30 seconds for a delayed mesh_steer or mesh_btw request; returns the reply or pending status.",
     parameters: Type.Object({ id: Type.String(), requestId: Type.String() }),
-    async execute(_callId, args, signal) {
-      const response = await waitFor(args.id, args.requestId, signal);
-      return { content: [{ type: "text", text: describe(response) }], details: response };
+    async execute(_callId, args, signal, _onUpdate, ctx) {
+      const tracked = requests.get(args.requestId);
+      if (tracked?.target === args.id) stopWatching(args.requestId);
+      try {
+        const response = await waitFor(args.id, args.requestId, signal);
+        updateTracked(args.requestId, response);
+        return { content: [{ type: "text", text: describe(response) }], details: response };
+      } finally {
+        if (tracked?.target === args.id && member && requests.get(args.requestId)?.state === "pending") watchRequest(args.id, args.requestId, tracked.kind, ctx);
+      }
     },
   });
 
@@ -568,8 +587,17 @@ export default function (pi: ExtensionAPI) {
         if (!record || !requests.get(record.id)) return;
         const action = await ctx.ui.select(`Request ${record.id}`, record.state === "pending" ? ["Wait (up to 30 seconds)", "Cancel / dismiss"] : ["Show reply", "Dismiss"]);
         if (action === "Wait (up to 30 seconds)") {
-          const response = await waitFor(record.target, record.id);
-          pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
+          stopWatching(record.id);
+          try {
+            const response = await waitFor(record.target, record.id);
+            const firstResult = updateTracked(record.id, response);
+            if (response.status === "done") {
+              if (firstResult) deliverReply(record.kind, record.target, record.id, response.text);
+              else ctx.ui.notify("Reply already delivered; open /mesh:requests to view it", "info");
+            } else pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
+          } finally {
+            if (member && requests.get(record.id)?.state === "pending") watchRequest(record.target, record.id, record.kind, ctx);
+          }
         } else if (action === "Cancel / dismiss" || action === "Dismiss") ctx.ui.notify(await cancelTracked(record.id), "info");
         else if (action === "Show reply") {
           const latest = requests.get(record.id);
