@@ -25,6 +25,15 @@ type Request =
   | { action: "cancel"; requestId: string; from: string };
 type Job = { id: string; kind: Kind; from: string; text: string; result?: Response; waiters: Set<(response: Response) => void> };
 
+type OmCompaction = {
+  sessionId: string;
+  attemptId: string;
+  shouldResume: boolean;
+  terminalTurn: boolean;
+  phase: "starting" | "compacted" | "resume-sent" | "failed";
+  error?: string;
+};
+
 function directory() {
   return join(tmpdir(), `pi-mesh-${process.getuid?.() ?? process.env.USER ?? "user"}`);
 }
@@ -154,6 +163,8 @@ export default function (pi: ExtensionAPI) {
   let listenerId: string | undefined;
   let steerActive: Job | undefined;
   let lastAnswer: Response | undefined;
+  let terminalAnswer: Response | undefined;
+  let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
   let btwRunning = false;
   let btwAbort: AbortController | undefined;
   let listenerContext: ExtensionContext | undefined;
@@ -230,6 +241,9 @@ export default function (pi: ExtensionAPI) {
     jobs.clear();
     steerActive = undefined;
     lastAnswer = undefined;
+    terminalAnswer = undefined;
+    if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
+    steerCompaction = undefined;
     for (const socket of sockets) socket.destroy();
     oldServer?.close();
     if (oldId) await unlink(socketPath(oldId)).catch(() => {});
@@ -283,6 +297,9 @@ export default function (pi: ExtensionAPI) {
               if (request.kind === "steer") {
                 steerActive = job;
                 lastAnswer = undefined;
+                terminalAnswer = undefined;
+                if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
+                steerCompaction = undefined;
                 void announce(ctx).catch(() => {});
                 try { pi.sendUserMessage(header("steer", job.from, selfId, job.id, job.text)); }
                 catch (error) {
@@ -433,8 +450,73 @@ export default function (pi: ExtensionAPI) {
     return describe(response).trim();
   }
 
+  function finishSteer(result: Response) {
+    if (!steerActive) return;
+    finish(steerActive, result);
+    steerActive = undefined;
+    lastAnswer = undefined;
+    terminalAnswer = undefined;
+    if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
+    steerCompaction = undefined;
+    if (listenerContext) void announce(listenerContext).catch(() => {});
+    scheduleBtw();
+  }
+
+  // OM publishes its intent before compact() aborts the original run. Pi's ordinary
+  // compaction hooks run only after that abort, so they cannot identify this boundary.
+  pi.events.on("observational-memory:compaction", (data: unknown) => {
+    if (!data || typeof data !== "object") return;
+    const event = data as Partial<OmCompaction>;
+    if (!steerActive || typeof event.sessionId !== "string" || event.sessionId !== listenerContext?.sessionManager.getSessionId() || typeof event.attemptId !== "string") return;
+    if (event.phase === "starting") {
+      if (typeof event.shouldResume !== "boolean" || typeof event.terminalTurn !== "boolean") return;
+      if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
+      steerCompaction = { ...event, sessionId: event.sessionId, attemptId: event.attemptId, phase: "starting", shouldResume: event.shouldResume, terminalTurn: event.terminalTurn, jobId: steerActive.id, settled: false, resumed: false, started: false };
+      return;
+    }
+    const state = steerCompaction;
+    if (!state || state.jobId !== steerActive.id || state.attemptId !== event.attemptId) return;
+    if (event.phase === "failed") {
+      finishSteer({ status: "error", error: `Compaction interrupted steer: ${event.error ?? "unknown failure"}` });
+    } else if (event.phase === "compacted") {
+      state.phase = "compacted";
+      if (state.settled) finishSteer(state.terminalTurn ? terminalAnswer ?? lastAnswer ?? { status: "error", error: "No final answer after compaction" } : { status: "error", error: "Compaction did not resume the steer" });
+    } else if (event.phase === "resume-sent" && state.shouldResume) {
+      state.phase = "resume-sent";
+      // Pi's sendMessage is void and reports asynchronous rejection only to the
+      // extension error channel. Bound only this handoff, not the resumed agent run.
+      state.handoffTimer = setTimeout(() => {
+        if (steerCompaction === state && !state.started) finishSteer({ status: "error", error: "OM continuation did not start" });
+      }, 30_000);
+    }
+  });
+
   pi.on("session_start", async (_event, ctx) => { await setSessionIdentity(ctx); });
-  pi.on("agent_start", (_event, ctx) => { void announce(ctx).catch(() => {}); });
+  pi.on("before_agent_start", (event) => {
+    const state = steerCompaction;
+    if (!steerActive || !state || state.phase !== "resume-sent") return;
+    const details = event.messageType === "custom" ? event.message.details as { compactionAttemptId?: unknown } | undefined : undefined;
+    if (event.messageType === "custom" && event.message.customType === "om.resume" && details?.compactionAttemptId === state.attemptId) {
+      state.resumed = true;
+      lastAnswer = undefined;
+      terminalAnswer = undefined;
+    } else finishSteer({ status: "error", error: "Unrelated run started before OM resumed the steer" });
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    const state = steerCompaction;
+    if (state?.resumed && !state.started) {
+      state.started = true;
+      if (state.handoffTimer) clearTimeout(state.handoffTimer);
+      state.handoffTimer = undefined;
+    }
+    void announce(ctx).catch(() => {});
+  });
+  pi.on("turn_end", (event) => {
+    if (!steerActive || event.toolResults.length || event.message.role !== "assistant") return;
+    const answer = event.message;
+    if (answer.stopReason !== "stop") return;
+    terminalAnswer = { status: "done", text: answer.content.filter((block) => block.type === "text").map((block) => block.text).join("\n") };
+  });
   pi.on("agent_end", (event) => {
     if (!steerActive) return;
     const answer = [...event.messages].reverse().find((message) => message.role === "assistant");
@@ -446,9 +528,12 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("agent_settled", (event, ctx) => {
     if (steerActive) {
-      finish(steerActive, event.aborted ? { status: "error", error: "Agent aborted" } : lastAnswer ?? { status: "error", error: "No final answer" });
-      steerActive = undefined;
-      lastAnswer = undefined;
+      const state = steerCompaction;
+      if (state && !state.resumed) {
+        state.settled = true;
+        if (state.phase === "compacted") finishSteer(state.terminalTurn ? terminalAnswer ?? lastAnswer ?? { status: "error", error: "No final answer after compaction" } : { status: "error", error: "Compaction did not resume the steer" });
+        // Otherwise OM owns this abort; wait for its attempt-scoped outcome/resume.
+      } else finishSteer(event.aborted ? { status: "error", error: "Agent aborted" } : lastAnswer ?? { status: "error", error: "No final answer" });
     }
     void announce(ctx).catch(() => {});
     scheduleBtw();
