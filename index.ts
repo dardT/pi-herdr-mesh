@@ -166,6 +166,9 @@ export default function (pi: ExtensionAPI) {
   let terminalAnswer: Response | undefined;
   let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
   let btwRunning = false;
+  let activeBtw: Job | undefined;
+  let outgoingBtw = 0;
+  let membershipRun = 0;
   let btwAbort: AbortController | undefined;
   let btwRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let listenerContext: ExtensionContext | undefined;
@@ -185,6 +188,25 @@ export default function (pi: ExtensionAPI) {
     }
     selfId = id;
     catalog = createCatalog(id);
+  }
+
+  function updateMeshStatus() {
+    const ctx = listenerContext;
+    if (!member || !ctx) return;
+    const pending = outgoingBtw + requests.list().filter((request) => request.kind === "btw" && request.state === "pending").length;
+    const activity = [
+      activeBtw ? "BTW answering" : undefined,
+      btwQueue.length ? `${btwQueue.length} BTW queued` : undefined,
+      pending ? `${pending} BTW outgoing` : undefined,
+    ].filter(Boolean).join(" · ");
+    ctx.ui.setStatus("pi-mesh", `mesh ${selfId}${activity ? ` · ${activity}` : ""}`);
+  }
+
+  async function withBtwIndicator<T>(kind: Kind, operation: () => Promise<T>): Promise<T> {
+    const run = membershipRun;
+    if (kind === "btw") { ++outgoingBtw; updateMeshStatus(); }
+    try { return await operation(); }
+    finally { if (kind === "btw" && run === membershipRun) { --outgoingBtw; updateMeshStatus(); } }
   }
 
   async function announce(ctx: ExtensionContext) {
@@ -222,16 +244,19 @@ export default function (pi: ExtensionAPI) {
     }
     const job = btwQueue.shift()!;
     btwRunning = true;
+    activeBtw = job;
+    updateMeshStatus();
     void announce(ctx).catch(() => {});
     void (async () => {
       try { await answerBtw(job, ctx); }
       catch (error) { finish(job, { status: "error", error: error instanceof Error ? error.message : String(error) }); }
-      finally { btwAbort = undefined; btwRunning = false; scheduleBtw(); void announce(ctx).catch(() => {}); }
+      finally { btwAbort = undefined; btwRunning = false; activeBtw = undefined; scheduleBtw(); updateMeshStatus(); void announce(ctx).catch(() => {}); }
     })();
   }
 
   async function stop(ctx: ExtensionContext) {
     member = false;
+    ++membershipRun;
     for (const controller of watches.values()) controller.abort();
     watches.clear();
     pendingPrompts.clear();
@@ -246,6 +271,8 @@ export default function (pi: ExtensionAPI) {
     btwAbort?.abort();
     if (btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
     btwQueue.length = 0;
+    activeBtw = undefined;
+    outgoingBtw = 0;
     for (const job of jobs.values()) finish(job, { status: "error", error: "Listener stopped" });
     jobs.clear();
     steerActive = undefined;
@@ -321,6 +348,7 @@ export default function (pi: ExtensionAPI) {
               } else {
                 btwQueue.push(job);
                 scheduleBtw();
+                updateMeshStatus();
                 void announce(ctx).catch(() => {});
               }
               response = request.delayed ? { status: "pending", requestId: id } : await awaitJob(job);
@@ -335,6 +363,7 @@ export default function (pi: ExtensionAPI) {
               if (index < 0) throw new Error("Request already started or finished; cannot cancel at target");
               btwQueue.splice(index, 1);
               if (!btwQueue.length && btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
+              updateMeshStatus();
               finish(job, { status: "error", error: "Queued BTW cancelled by sender" });
               void announce(ctx).catch(() => {});
               response = { status: "done", text: "Queued BTW cancelled at target" };
@@ -357,7 +386,7 @@ export default function (pi: ExtensionAPI) {
     member = true;
     listenerId = id;
     listenerContext = ctx;
-    ctx.ui.setStatus("pi-mesh", `listening: ${id}`);
+    updateMeshStatus();
     try { await announce(ctx); }
     catch (error) { await stop(ctx); throw error; }
   }
@@ -403,6 +432,7 @@ export default function (pi: ExtensionAPI) {
       pendingPrompts.delete(requestId);
     }
     else return false;
+    updateMeshStatus();
     return true;
   }
 
@@ -454,6 +484,7 @@ export default function (pi: ExtensionAPI) {
     }
     requests.dismiss(requestId);
     pendingPrompts.delete(requestId);
+    updateMeshStatus();
     return outcome;
   }
 
@@ -587,8 +618,12 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify(`Left the mesh${pendingBtw.length ? `; attempted to cancel ${pendingBtw.length} pending BTW request(s). Started work cannot be undone.` : ""}`, "info");
         } else if (action === "status") {
           if (!member) return ctx.ui.notify("Outside the mesh", "info");
+          const active = activeBtw ? `\nAnswering BTW: ${activeBtw.id} ← ${activeBtw.from}` : "";
+          const queued = btwQueue.length
+            ? btwQueue.map((job, index) => `  ${index + 1}. ${job.id} ← ${job.from}`).join("\n")
+            : "  (none)";
           const blocked = steerActive ? `steer ${steerActive.id}` : btwRunning ? "another BTW" : ctx.isIdle() ? "nothing (idle)" : "an agent run or compaction";
-          ctx.ui.notify(`In the mesh as ${selfId} (listening) · BTW blocked by: ${blocked}\nIncoming BTW queue (${btwQueue.length})`, "info");
+          ctx.ui.notify(`In the mesh as ${selfId} (listening) · BTW blocked by: ${blocked}${active}\nIncoming BTW queue (${btwQueue.length}):\n${queued}`, "info");
         }
         else throw new Error("Usage: /mesh [on|off|status]");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
@@ -631,14 +666,16 @@ export default function (pi: ExtensionAPI) {
           requireMembership();
           const delayed = delivery === "Send in background";
           const sender = selfId;
-          const response = await exchange(peer.id, { action: "send", kind, from: sender, text, delayed });
-          if (response.status === "pending") {
-            requests.track(response.requestId, peer.id, kind, sender);
-            pendingPrompts.set(response.requestId, text);
-            watchRequest(peer.id, response.requestId, kind, ctx);
-          }
-          if (response.status === "done") deliverReply(kind, peer.id, undefined, text, response.text);
-          else pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
+          await withBtwIndicator(kind, async () => {
+            const response = await exchange(peer.id, { action: "send", kind, from: sender, text, delayed });
+            if (response.status === "pending") {
+              requests.track(response.requestId, peer.id, kind, sender);
+              pendingPrompts.set(response.requestId, text);
+              watchRequest(peer.id, response.requestId, kind, ctx);
+            }
+            if (response.status === "done") deliverReply(kind, peer.id, undefined, text, response.text);
+            else pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
+          });
         } catch (error) { ctx.ui.notify(String(error), "error"); }
       },
     });
@@ -652,13 +689,15 @@ export default function (pi: ExtensionAPI) {
       async execute(_callId, args, signal, _onUpdate, ctx) {
         requireMembership();
         const sender = selfId;
-        const response = await exchange(args.id, { action: "send", kind, from: sender, text: args.text, delayed: args.delayed ?? false }, signal);
-        if (response.status === "pending") {
-          requests.track(response.requestId, args.id, kind, sender);
-          pendingPrompts.set(response.requestId, args.text);
-          watchRequest(args.id, response.requestId, kind, ctx);
-        }
-        return { content: [{ type: "text", text: response.status === "done" ? pairedReply(kind, args.id, undefined, args.text, response.text) : describe(response) }], details: response };
+        return withBtwIndicator(kind, async () => {
+          const response = await exchange(args.id, { action: "send", kind, from: sender, text: args.text, delayed: args.delayed ?? false }, signal);
+          if (response.status === "pending") {
+            requests.track(response.requestId, args.id, kind, sender);
+            pendingPrompts.set(response.requestId, args.text);
+            watchRequest(args.id, response.requestId, kind, ctx);
+          }
+          return { content: [{ type: "text" as const, text: response.status === "done" ? pairedReply(kind, args.id, undefined, args.text, response.text) : describe(response) }], details: response };
+        });
       },
     });
   }
