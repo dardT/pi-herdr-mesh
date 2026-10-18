@@ -566,16 +566,20 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  async function catalogListing(all = false): Promise<string> {
+    const workspaceKey = all ? undefined : herdrWorkspaceKey();
+    const peers = await catalog.list();
+    return formatCatalog(workspaceKey ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : peers, selfId, workspaceKey ? "ws" : "all");
+  }
+
   pi.registerCommand("mesh:catalog", {
-    description: "Display all cataloged Pi sessions, or /mesh:catalog ws for this Herdr workspace",
+    description: "Display this Herdr workspace's members, or /mesh:catalog --all for all local members",
+    getArgumentCompletions: (prefix) => "--all".startsWith(prefix.trimStart()) ? [{ value: "--all", label: "--all", description: "Show all local members" }] : null,
     handler: async (args, ctx) => {
       try {
-        const scope = catalogScope(args);
-        if (scope && scope !== "ws") throw new Error("Usage: /mesh:catalog [ws]");
-        const workspaceKey = scope === "ws" ? herdrWorkspaceKey() : undefined;
-        if (scope === "ws" && !workspaceKey) throw new Error("Workspace catalog requires a Herdr-managed pane");
-        const peers = await catalog.list();
-        ctx.ui.notify(formatCatalog(workspaceKey ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : peers, selfId, scope === "ws" ? "ws" : "all"), "info");
+        const option = args.trim();
+        if (option && option !== "--all") throw new Error("Usage: /mesh:catalog [--all]");
+        ctx.ui.notify(await catalogListing(option === "--all"), "info");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
   });
@@ -610,8 +614,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "mesh_catalog",
     label: "List Pi Herdr Mesh catalog",
-    description: "Show discovered running Pi sessions, their IDs, folder, git branch, name, listening status, and last refreshed purpose. Refresh is a manual slash command.",
-    parameters: Type.Object({}),
-    async execute() { return { content: [{ type: "text", text: formatCatalog(await catalog.list(), selfId) }], details: {} }; },
+    description: "Show members of the current Herdr workspace by default, or all same-user members with all: true. Includes IDs, folder, git branch, name, status, and last refreshed purpose. Outside Herdr, defaults to all. Refresh is a manual slash command.",
+    parameters: Type.Object({ all: Type.Optional(Type.Boolean({ description: "Show all same-user mesh members across workspaces" })) }),
+    async execute(_callId, args) { return { content: [{ type: "text", text: await catalogListing(args.all) }], details: {} }; },
   });
 }
