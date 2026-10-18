@@ -137,17 +137,6 @@ function formatRequests(records: RequestRecord[]): string {
   return records.map((record) => `${record.id} · ${record.kind} → ${record.target} · ${record.state === "pending" ? "pending (watching for reply)" : record.state} · ${new Date(record.startedAt).toLocaleTimeString()}${record.error ? `\n  ${record.error}` : ""}`).join("\n");
 }
 
-function refreshProgress(completed: number, total: number): string {
-  const width = 10;
-  const filled = total === 0 ? width : Math.floor((completed / total) * width);
-  return `Pi Herdr Mesh refresh [${"█".repeat(filled)}${"░".repeat(width - filled)}] ${completed}/${total}`;
-}
-
-function catalogScope(args: string): string | undefined {
-  const raw = args.trim();
-  return raw === '"ws"' || raw === "'ws'" ? "ws" : raw || undefined;
-}
-
 function formatCatalog(peers: PeerRecord[], selfId: string, scope: "all" | "ws" = "all"): string {
   const heading = `Current Pi: ${selfId} · ${scope === "ws" ? "Herdr workspace" : "all local sessions"}`;
   if (!peers.length) return `${heading}\nNo sessions in this catalog scope. Other Pi processes must load Pi Herdr Mesh via /reload to appear.`;
@@ -168,7 +157,6 @@ export default function (pi: ExtensionAPI) {
 
   let selfId = randomUUID().slice(0, 8);
   let catalog = createCatalog(selfId);
-  let refreshRun = 0;
   let server: Server | undefined;
   let member = false;
   let listenerId: string | undefined;
@@ -272,8 +260,6 @@ export default function (pi: ExtensionAPI) {
     for (const controller of watches.values()) controller.abort();
     watches.clear();
     pendingPrompts.clear();
-    ++refreshRun;
-    ctx.ui.setStatus("pi-mesh-refresh", undefined);
     const oldServer = server;
     const oldId = listenerId;
     server = undefined;
@@ -300,7 +286,7 @@ export default function (pi: ExtensionAPI) {
 
   async function listen(id: string, ctx: ExtensionContext) {
     if (server) throw new Error(`Already in the mesh as ${listenerId}; run /mesh off first`);
-    if (id === "ws") throw new Error("ID ws is reserved for workspace refresh");
+    if (id === "ws") throw new Error("ID ws is reserved");
     const path = socketPath(id);
     await secureDirectory();
     try {
@@ -403,19 +389,6 @@ export default function (pi: ExtensionAPI) {
     updateMeshStatus();
     try { await announce(ctx); }
     catch (error) { await stop(ctx); throw error; }
-  }
-
-  async function targetCompletions(prefix: string) {
-    const fragment = prefix.trimStart();
-    if (/\s/.test(fragment)) return null;
-    const peers = await catalog.list();
-    const items = peers.filter((peer) => peer.id.startsWith(fragment)).slice(0, 30).map((peer) => ({
-      value: peer.id,
-      label: `${peer.id}${peer.name ? ` — ${peer.name}` : ""}`,
-      description: `${peer.workspaceId ? `Herdr ${peer.workspaceId} · ` : ""}${peer.activity ?? "idle"}`,
-    }));
-    if ("ws".startsWith(fragment)) items.unshift({ value: "ws", label: "ws — current Herdr workspace", description: "Scope to this workspace" });
-    return items.length ? items : null;
   }
 
   function requireMembership() {
@@ -614,8 +587,6 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("session_info_changed", (_event, ctx) => { void announce(ctx).catch(() => {}); });
   pi.on("session_shutdown", async (_event, ctx) => {
-    ++refreshRun;
-    ctx.ui.setStatus("pi-mesh-refresh", undefined);
     await stop(ctx);
     for (const request of requests.list()) requests.dismiss(request.id);
   });
@@ -840,34 +811,6 @@ export default function (pi: ExtensionAPI) {
         if (option && option !== "--all") throw new Error("Usage: /mesh:catalog [--all]");
         ctx.ui.notify(await catalogListing(option === "--all"), "info");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
-    },
-  });
-  pi.registerCommand("mesh:catalog:refresh", {
-    description: "Refresh changed purposes for all sessions, the Herdr workspace (ws), or one ID",
-    getArgumentCompletions: targetCompletions,
-    handler: async (args, ctx) => {
-      const run = ++refreshRun;
-      try {
-        requireMembership();
-        const scope = catalogScope(args);
-        const workspaceKey = scope === "ws" ? herdrWorkspaceKey() : undefined;
-        if (scope === "ws" && !workspaceKey) throw new Error("Workspace refresh requires a Herdr-managed pane");
-        const id = scope === "ws" ? undefined : scope;
-        if (id) socketPath(id);
-        if (ctx.mode === "tui") ctx.ui.setStatus("pi-mesh-refresh", "Pi Herdr Mesh refresh [░░░░░░░░░░] discovering…");
-        const failures: string[] = [];
-        const peers = await catalog.refresh(id, async (peer) => {
-          try { return await purposeFor(peer); }
-          catch (error) { failures.push(`${peer.id}: ${error instanceof Error ? error.message : String(error)}`); throw error; }
-        }, workspaceKey, (completed, total) => {
-          if (ctx.mode === "tui" && run === refreshRun) ctx.ui.setStatus("pi-mesh-refresh", refreshProgress(completed, total));
-        });
-        if (id && !peers.some((peer) => peer.id === id)) throw new Error(`Unknown catalog ID: ${id}`);
-        const shown = workspaceKey ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : id ? peers.filter((peer) => peer.id === id) : peers;
-        ctx.ui.notify(formatCatalog(shown, selfId, scope === "ws" ? "ws" : "all"), "info");
-        if (failures.length) ctx.ui.notify(`Purpose refresh failed (will retry): ${failures.join("; ")}`, "warning");
-      } catch (error) { ctx.ui.notify(String(error), "error"); }
-      finally { if (ctx.mode === "tui" && run === refreshRun) ctx.ui.setStatus("pi-mesh-refresh", undefined); }
     },
   });
   pi.registerTool({

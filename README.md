@@ -40,7 +40,7 @@ A project can override it with `.mesh/settings.json`. Pi uses the nearest settin
 | --- | --- |
 | `/mesh` or `/mesh on` | Join the mesh and begin listening. |
 | `/mesh off` | Leave the mesh and cancel queued outgoing BTW requests when possible. |
-| `/mesh status` | Show membership, session ID, and incoming BTW queue state. |
+| `/mesh status` | Show membership, mesh ID, and incoming BTW queue state. |
 | `/mesh:catalog [--all]` | List listening sessions. By default, scope to the current Herdr workspace; use `--all` for every local workspace. |
 | `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject steer requests. |
 | `/mesh:btw` | Queue a context-only, tool-free question until the recipient is idle. |
@@ -53,7 +53,7 @@ The picker starts in the current Herdr workspace and can expand to all workspace
 | Tool | Description |
 | --- | --- |
 | `mesh_catalog({ all? })` | List listening sessions in the current Herdr workspace, or all local workspaces. |
-| `mesh_find({ query, all? })` | Rank task-relevant sessions before sending; it never selects one automatically. |
+| `mesh_find({ query, all? })` | Rank task-relevant sessions before sending, selectively refreshing up to three stale purposes; it never selects one automatically. |
 | `mesh_steer({ id, text, delayed? })` | Send a lasting request that changes the target conversation and can use its usual tools. |
 | `mesh_btw({ id, text, delayed? })` | Ask an isolated, tool-free question. It is visible in the target transcript but does not enter its working context. |
 | `mesh_wait({ id, requestId })` | Wait for a delayed request's result. |
