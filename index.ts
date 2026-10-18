@@ -327,21 +327,16 @@ export default function (pi: ExtensionAPI) {
     catch (error) { await stop(ctx); throw error; }
   }
 
-  async function targetCompletions(prefix: string, options: { delayed?: boolean; workspace?: boolean; listeningOnly?: boolean; includeSelf?: boolean } = {}) {
-    const input = prefix.trimStart();
-    const match = options.delayed ? input.match(/^(--delayed\s+)?([^\s]*)$/) : input.match(/^([^\s]*)$/);
-    if (!match) return null;
-    const delayedPrefix = options.delayed ? match[1] ?? "" : "";
-    const fragment = options.delayed ? match[2] : match[1];
+  async function targetCompletions(prefix: string) {
+    const fragment = prefix.trimStart();
+    if (/\s/.test(fragment)) return null;
     const peers = await catalog.list();
-    const matches = peers.filter((peer) => (options.includeSelf || peer.id !== selfId) && (!options.listeningOnly || peer.listening) && peer.id.startsWith(fragment));
-    const items = matches.slice(0, 30).map((peer) => ({
-      value: `${delayedPrefix}${peer.id} `,
+    const items = peers.filter((peer) => peer.id.startsWith(fragment)).slice(0, 30).map((peer) => ({
+      value: peer.id,
       label: `${peer.id}${peer.name ? ` — ${peer.name}` : ""}`,
-      description: `${peer.workspaceId ? `Herdr ${peer.workspaceId} · ` : ""}${peer.listening ? peer.activity ?? "listening" : "not listening"}`,
+      description: `${peer.workspaceId ? `Herdr ${peer.workspaceId} · ` : ""}${peer.activity ?? "idle"}`,
     }));
-    if (options.workspace && "ws".startsWith(fragment)) items.unshift({ value: "ws", label: "ws — current Herdr workspace", description: "Scope to this workspace" });
-    if (options.delayed && !delayedPrefix && "--delayed".startsWith(fragment)) items.unshift({ value: "--delayed ", label: "--delayed", description: "Return a request ID immediately" });
+    if ("ws".startsWith(fragment)) items.unshift({ value: "ws", label: "ws — current Herdr workspace", description: "Scope to this workspace" });
     return items.length ? items : null;
   }
 
@@ -374,13 +369,6 @@ export default function (pi: ExtensionAPI) {
     }
     requests.dismiss(requestId);
     return outcome;
-  }
-
-  async function waitCompletions(prefix: string) {
-    const match = prefix.trimStart().match(/^(\S+)\s+([^\s]*)$/);
-    if (!match) return targetCompletions(prefix);
-    const matches = requests.list().filter((record) => record.target === match[1] && record.id.startsWith(match[2]));
-    return matches.length ? matches.map((record) => ({ value: `${match[1]} ${record.id}`, label: `${record.id} · ${record.state}` })) : null;
   }
 
   async function purposeFor(peer: PeerRecord): Promise<string> {
@@ -449,21 +437,44 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  async function pickRecipient(ctx: ExtensionContext): Promise<PeerRecord | undefined> {
+    const workspaceKey = herdrWorkspaceKey();
+    let scope: "ws" | "all" = workspaceKey ? "ws" : "all";
+    while (true) {
+      requireMembership();
+      const peers = (await catalog.list()).filter((peer) => peer.id !== selfId && peer.listening);
+      const choices = scope === "ws" ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : peers;
+      if (!peers.length) { ctx.ui.notify("No other mesh members are listening", "warning"); return undefined; }
+      const labels = choices.map((peer) => `${peer.id}${peer.name ? ` — ${peer.name}` : ""} · ${peer.activity ?? "idle"}${peer.workspaceId ? ` · Herdr ${peer.workspaceId}` : ""}`);
+      const toggle = scope === "ws" ? "Show all workspaces…" : "Show current workspace…";
+      if (workspaceKey) labels.push(toggle);
+      const selected = await ctx.ui.select(`Choose recipient · ${scope === "ws" ? "current workspace" : "all workspaces"}${choices.length ? "" : " (none here)"}`, labels);
+      if (selected === undefined) return undefined;
+      if (workspaceKey && selected === toggle) { scope = scope === "ws" ? "all" : "ws"; continue; }
+      return choices[labels.indexOf(selected)];
+    }
+  }
+
   for (const kind of ["steer", "btw"] as const) {
     pi.registerCommand(`mesh:${kind}`, {
-      description: `${kind === "steer" ? "Permanently steer" : "Ask a context-only question of"} a listening session; --delayed returns an ID`,
-      getArgumentCompletions: (prefix) => targetCompletions(prefix, { delayed: true, listeningOnly: true }),
+      description: `${kind === "steer" ? "Steer" : "Ask BTW"} another mesh member using a recipient picker and multiline editor`,
       handler: async (args, ctx) => {
         try {
-          const input = args.trim();
-          const delayed = input.startsWith("--delayed ");
-          const value = delayed ? input.slice(10).trim() : input;
-          const match = value.match(/^(\S+)\s+([\s\S]+)$/);
-          if (!match) throw new Error(`Usage: /mesh:${kind} [--delayed] <id> <text>`);
+          if (args.trim()) throw new Error(`Usage: /mesh:${kind} (no arguments; use the guided picker)`);
           requireMembership();
+          if (!ctx.hasUI) throw new Error(`The /mesh:${kind} picker requires an interactive UI; use the mesh_${kind} tool instead`);
+          const peer = await pickRecipient(ctx);
+          if (!peer) return;
+          const text = await ctx.ui.editor(`${kind === "steer" ? "Steer" : "Ask BTW"} ${peer.id}`);
+          if (text === undefined) return;
+          if (!text.trim()) throw new Error("Request cannot be empty");
+          const delivery = await ctx.ui.select("Delivery", ["Send & wait", "Send in background"]);
+          if (!delivery) return;
+          requireMembership();
+          const delayed = delivery === "Send in background";
           const sender = selfId;
-          const response = await exchange(match[1], { action: "send", kind, from: sender, text: match[2], delayed });
-          if (response.status === "pending") requests.track(response.requestId, match[1], kind, sender);
+          const response = await exchange(peer.id, { action: "send", kind, from: sender, text, delayed });
+          if (response.status === "pending") requests.track(response.requestId, peer.id, kind, sender);
           pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
         } catch (error) { ctx.ui.notify(String(error), "error"); }
       },
@@ -485,18 +496,6 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  pi.registerCommand("mesh:wait", {
-    description: "Wait up to 30 seconds for a delayed request: /mesh:wait <id> <request-id>",
-    getArgumentCompletions: waitCompletions,
-    handler: async (args, ctx) => {
-      try {
-        const [id, requestId, ...extra] = args.trim().split(/\s+/);
-        if (!id || !requestId || extra.length) throw new Error("Usage: /mesh:wait <id> <request-id>");
-        const response = await waitFor(id, requestId);
-        pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
-      } catch (error) { ctx.ui.notify(String(error), "error"); }
-    },
-  });
   pi.registerTool({
     name: "mesh_wait",
     label: "Wait for Pi Herdr Mesh request",
@@ -521,7 +520,7 @@ export default function (pi: ExtensionAPI) {
         if (id) {
           const record = requests.get(id);
           if (!record) throw new Error(`Unknown tracked request: ${id}`);
-          const text = record.state === "done" ? record.reply ?? "(Empty reply)" : record.state === "error" ? record.error ?? "Unknown error" : `${id} is pending; use /mesh:wait ${record.target} ${id}`;
+          const text = record.state === "done" ? record.reply ?? "(Empty reply)" : record.state === "error" ? record.error ?? "Unknown error" : `${id} is pending; select Wait in /mesh:requests or use the mesh_wait tool`;
           pi.sendMessage({ customType: "pi-mesh-reply", content: text, display: true }, { triggerTurn: false });
           return;
         }
@@ -541,22 +540,6 @@ export default function (pi: ExtensionAPI) {
           const latest = requests.get(record.id);
           ctx.ui.notify(latest?.state === "error" ? latest.error ?? "Unknown error" : latest?.reply ?? "(Empty reply)", "info");
         }
-      } catch (error) { ctx.ui.notify(String(error), "error"); }
-    },
-  });
-  pi.registerCommand("mesh:cancel", {
-    description: "Cancel a queued BTW at its target, or dismiss local tracking: /mesh:cancel <request-id>",
-    getArgumentCompletions: (prefix) => {
-      if (/\s/.test(prefix)) return null;
-      const matches = requests.list().filter((record) => record.id.startsWith(prefix));
-      return matches.length ? matches.map((record) => ({ value: record.id, label: `${record.id} · ${record.state}` })) : null;
-    },
-    handler: async (args, ctx) => {
-      try {
-        const id = args.trim();
-        if (!id || /\s/.test(id)) throw new Error("Usage: /mesh:cancel <request-id>");
-        requireMembership();
-        ctx.ui.notify(await cancelTracked(id), "info");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
   });
@@ -598,7 +581,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerCommand("mesh:catalog:refresh", {
     description: "Refresh changed purposes for all sessions, the Herdr workspace (ws), or one ID",
-    getArgumentCompletions: (prefix) => targetCompletions(prefix, { workspace: true, includeSelf: true }),
+    getArgumentCompletions: targetCompletions,
     handler: async (args, ctx) => {
       const run = ++refreshRun;
       try {
