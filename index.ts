@@ -121,7 +121,7 @@ function header(kind: Kind, from: string, to: string, requestId: string, text: s
 
 function formatRequests(records: RequestRecord[]): string {
   if (!records.length) return "No delayed requests tracked in this session.";
-  return records.map((record) => `${record.id} · ${record.kind} → ${record.target} · ${record.state === "pending" ? "pending (last checked)" : record.state} · ${new Date(record.startedAt).toLocaleTimeString()}${record.error ? `\n  ${record.error}` : ""}`).join("\n");
+  return records.map((record) => `${record.id} · ${record.kind} → ${record.target} · ${record.state === "pending" ? "pending (watching for reply)" : record.state} · ${new Date(record.startedAt).toLocaleTimeString()}${record.error ? `\n  ${record.error}` : ""}`).join("\n");
 }
 
 function refreshProgress(completed: number, total: number): string {
@@ -160,6 +160,7 @@ export default function (pi: ExtensionAPI) {
   const btwQueue: Job[] = [];
   const jobs = new Map<string, Job>();
   const requests = createRequestTracker();
+  const watches = new Map<string, AbortController>();
   const sockets = new Set<Socket>();
 
   async function setSessionIdentity(ctx: ExtensionContext) {
@@ -211,6 +212,8 @@ export default function (pi: ExtensionAPI) {
 
   async function stop(ctx: ExtensionContext) {
     member = false;
+    for (const controller of watches.values()) controller.abort();
+    watches.clear();
     ++refreshRun;
     ctx.ui.setStatus("pi-mesh-refresh", undefined);
     const oldServer = server;
@@ -356,8 +359,34 @@ export default function (pi: ExtensionAPI) {
     return response;
   }
 
+  function watchRequest(target: string, requestId: string, kind: Kind, ctx: ExtensionContext) {
+    const controller = new AbortController();
+    watches.set(requestId, controller);
+    void (async () => {
+      try {
+        while (!controller.signal.aborted && requests.get(requestId)?.state === "pending") {
+          const response = await waitFor(target, requestId, controller.signal);
+          if (response.status === "pending") continue;
+          if (!controller.signal.aborted && requests.get(requestId)) {
+            ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} ${response.status === "done" ? "completed" : `failed: ${response.error}`}. Open /mesh:requests to view the result.`, response.status === "done" ? "info" : "warning");
+          }
+          break;
+        }
+      } catch (error) {
+        if (controller.signal.aborted || !requests.get(requestId)) return;
+        const message = error instanceof Error ? error.message : String(error);
+        requests.mark(requestId, "error", message);
+        ctx.ui.notify(`${kind.toUpperCase()} request ${requestId} failed: ${message}`, "warning");
+      } finally {
+        if (watches.get(requestId) === controller) watches.delete(requestId);
+      }
+    })();
+  }
+
   async function cancelTracked(requestId: string, signal?: AbortSignal): Promise<string> {
     const record = requests.get(requestId);
+    watches.get(requestId)?.abort();
+    watches.delete(requestId);
     if (!record) throw new Error(`Unknown tracked request: ${requestId}`);
     let outcome: string;
     if (record.state !== "pending") outcome = "Completed request dismissed locally";
@@ -474,7 +503,10 @@ export default function (pi: ExtensionAPI) {
           const delayed = delivery === "Send in background";
           const sender = selfId;
           const response = await exchange(peer.id, { action: "send", kind, from: sender, text, delayed });
-          if (response.status === "pending") requests.track(response.requestId, peer.id, kind, sender);
+          if (response.status === "pending") {
+            requests.track(response.requestId, peer.id, kind, sender);
+            watchRequest(peer.id, response.requestId, kind, ctx);
+          }
           pi.sendMessage({ customType: "pi-mesh-reply", content: describe(response), display: true }, { triggerTurn: false });
         } catch (error) { ctx.ui.notify(String(error), "error"); }
       },
@@ -486,11 +518,14 @@ export default function (pi: ExtensionAPI) {
         ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer."
         : "Requires the caller to join with /mesh on. Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
       parameters: Type.Object({ id: Type.String(), text: Type.String(), delayed: Type.Optional(Type.Boolean()) }),
-      async execute(_callId, args, signal) {
+      async execute(_callId, args, signal, _onUpdate, ctx) {
         requireMembership();
         const sender = selfId;
         const response = await exchange(args.id, { action: "send", kind, from: sender, text: args.text, delayed: args.delayed ?? false }, signal);
-        if (response.status === "pending") requests.track(response.requestId, args.id, kind, sender);
+        if (response.status === "pending") {
+          requests.track(response.requestId, args.id, kind, sender);
+          watchRequest(args.id, response.requestId, kind, ctx);
+        }
         return { content: [{ type: "text", text: describe(response) }], details: response };
       },
     });
@@ -520,7 +555,7 @@ export default function (pi: ExtensionAPI) {
         if (id) {
           const record = requests.get(id);
           if (!record) throw new Error(`Unknown tracked request: ${id}`);
-          const text = record.state === "done" ? record.reply ?? "(Empty reply)" : record.state === "error" ? record.error ?? "Unknown error" : `${id} is pending; select Wait in /mesh:requests or use the mesh_wait tool`;
+          const text = record.state === "done" ? record.reply ?? "(Empty reply)" : record.state === "error" ? record.error ?? "Unknown error" : `${id} is pending; the reply is being watched in the background`;
           pi.sendMessage({ customType: "pi-mesh-reply", content: text, display: true }, { triggerTurn: false });
           return;
         }
@@ -546,7 +581,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "mesh_requests",
     label: "List outgoing delayed mesh requests",
-    description: "List locally tracked delayed requests and their last checked status, or get one request's full reply by requestId. No automatic polling.",
+    description: "List locally tracked delayed requests with background-updated status, or get one request's full reply by requestId. Completed replies do not automatically enter the agent transcript.",
     parameters: Type.Object({ requestId: Type.Optional(Type.String()) }),
     async execute(_callId, args) {
       const record = args.requestId ? requests.get(args.requestId) : undefined;
