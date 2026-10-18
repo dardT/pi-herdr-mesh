@@ -46,7 +46,7 @@ A project can override it with `.mesh/settings.json`. Pi uses the nearest settin
 | `/mesh:btw` | Queue a context-only, tool-free question until the recipient is idle. |
 | `/mesh:requests [request-id]` | Inspect background requests, wait for a response, or cancel/dismiss local tracking. |
 
-The picker starts in the current Herdr workspace and can expand to all workspaces. Outside Herdr, it lists all local sessions.
+The picker starts in the current Herdr workspace and can expand to all workspaces. Outside Herdr, it lists all local sessions. Recipients are shown by session name (or folder), mesh ID, branch, activity, and any purpose already recorded in the catalog; stale purposes are marked “last known.” Opening the picker does not refresh purposes or make model calls.
 
 ## Agent tools and routing
 

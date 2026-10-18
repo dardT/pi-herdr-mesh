@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, unlink } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -135,6 +135,14 @@ function header(kind: Kind, from: string, to: string, requestId: string, text: s
 function formatRequests(records: RequestRecord[]): string {
   if (!records.length) return "No delayed requests tracked in this session.";
   return records.map((record) => `${record.id} · ${record.kind} → ${record.target} · ${record.state === "pending" ? "pending (watching for reply)" : record.state} · ${new Date(record.startedAt).toLocaleTimeString()}${record.error ? `\n  ${record.error}` : ""}`).join("\n");
+}
+
+function recipientLabel(peer: PeerRecord): string {
+  const folder = basename(peer.cwd) || peer.cwd;
+  const identity = peer.name ? `${peer.name} (${folder})` : folder;
+  const purpose = peer.purpose?.replace(/\s+/g, " ").trim();
+  const summary = purpose ? ` · ${peer.purposeRevision === peer.revision ? "Purpose" : "Last known purpose"}: ${purpose.length > 80 ? `${purpose.slice(0, 77)}…` : purpose}` : "";
+  return `${identity} · ${peer.id}${summary}${peer.branch ? ` · ${peer.branch}` : ""}${peer.workspaceId ? ` · Herdr ${peer.workspaceId}` : ""} · ${peer.activity ?? "status unknown"}`;
 }
 
 function formatCatalog(peers: PeerRecord[], selfId: string, scope: "all" | "ws" = "all"): string {
@@ -639,7 +647,7 @@ export default function (pi: ExtensionAPI) {
       const peers = (await catalog.list()).filter((peer) => peer.id !== selfId && peer.listening);
       const choices = scope === "ws" ? peers.filter((peer) => peer.workspaceKey === workspaceKey) : peers;
       if (!peers.length) { ctx.ui.notify("No other mesh members are listening", "warning"); return undefined; }
-      const labels = choices.map((peer) => `${peer.id}${peer.name ? ` — ${peer.name}` : ""} · ${peer.activity ?? "idle"}${peer.workspaceId ? ` · Herdr ${peer.workspaceId}` : ""}`);
+      const labels = choices.map(recipientLabel);
       const toggle = scope === "ws" ? "Show all workspaces…" : "Show current workspace…";
       if (workspaceKey) labels.push(toggle);
       const selected = await ctx.ui.select(`Choose recipient · ${scope === "ws" ? "current workspace" : "all workspaces"}${choices.length ? "" : " (none here)"}`, labels);
