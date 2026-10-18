@@ -20,7 +20,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "files": ["index.ts", "catalog.ts", "requests.ts", "routing.ts", "README.md", "LICENSE"],
+  "files": ["index.ts", "catalog.ts", "requests.ts", "routing.ts", "settings.ts", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./index.ts"]
   }

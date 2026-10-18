@@ -9,6 +9,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js";
 import { createRequestTracker, type RequestRecord } from "./requests.js";
 import { clearMetadataMatch, rankPeers } from "./routing.js";
+import { joinByDefault } from "./settings.js";
 
 const WAIT_MS = 30_000;
 const MAX_BYTES = 1024 * 1024;
@@ -556,7 +557,15 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_start", async (_event, ctx) => { await setSessionIdentity(ctx); });
+  pi.on("session_start", async (_event, ctx) => {
+    await setSessionIdentity(ctx);
+    if (member) return;
+    try {
+      if (await joinByDefault(ctx.cwd)) await listen(selfId, ctx);
+    } catch (error) {
+      ctx.ui.notify(`Mesh auto-join failed: ${String(error)}`, "warning");
+    }
+  });
   pi.on("before_agent_start", (event) => {
     const state = steerCompaction;
     if (!steerActive || !state || state.phase !== "resume-sent") return;
