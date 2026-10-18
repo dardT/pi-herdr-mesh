@@ -132,7 +132,7 @@ function formatCatalog(peers: PeerRecord[], selfId: string, scope: "all" | "ws" 
   const heading = `Current Pi: ${selfId} · ${scope === "ws" ? "Herdr workspace" : "all local sessions"}`;
   if (!peers.length) return `${heading}\nNo sessions in this catalog scope. Other Pi processes must load Pi Herdr Mesh via /reload to appear.`;
   return `${heading}\n\n${peers.map((peer) => [
-    `${peer.id}${peer.id === selfId ? " ← you" : ""}${peer.listening ? " (listening)" : " (not listening)"}${peer.name ? ` — ${peer.name}` : ""}`,
+    `${peer.id}${peer.id === selfId ? " ← you" : ""} (${peer.listening ? "listening" : "not listening"} · ${peer.activity ?? "status unknown"}${peer.queuedBtw ? ` · ${peer.queuedBtw} BTW queued` : ""})${peer.name ? ` — ${peer.name}` : ""}`,
     `  ${peer.cwd}${peer.branch ? ` [${peer.branch}]` : ""}${peer.workspaceId ? ` · Herdr ${peer.workspaceId}` : ""}`,
     `  Purpose: ${peer.purpose ?? (peer.listening ? "not refreshed" : "unavailable (not listening)")}`,
   ].join("\n")).join("\n\n")}`;
@@ -154,7 +154,8 @@ export default function (pi: ExtensionAPI) {
   const sockets = new Set<Socket>();
 
   async function announce(ctx: ExtensionContext) {
-    await catalog.announce(ctx, !!server);
+    const activity = btwRunning ? "answering-btw" : steerActive || !ctx.isIdle() ? "busy" : "idle";
+    await catalog.announce(ctx, !!server, activity, btwQueue.length);
   }
 
   async function answerBtw(job: Job, ctx: ExtensionContext): Promise<void> {
@@ -179,10 +180,11 @@ export default function (pi: ExtensionAPI) {
     if (!ctx || !server || btwRunning || steerActive || !ctx.isIdle() || !btwQueue.length) return;
     const job = btwQueue.shift()!;
     btwRunning = true;
+    void announce(ctx).catch(() => {});
     void (async () => {
       try { await answerBtw(job, ctx); }
       catch (error) { finish(job, { status: "error", error: error instanceof Error ? error.message : String(error) }); }
-      finally { btwAbort = undefined; btwRunning = false; scheduleBtw(); }
+      finally { btwAbort = undefined; btwRunning = false; scheduleBtw(); void announce(ctx).catch(() => {}); }
     })();
   }
 
@@ -252,6 +254,7 @@ export default function (pi: ExtensionAPI) {
               if (request.kind === "steer") {
                 steerActive = job;
                 lastAnswer = undefined;
+                void announce(ctx).catch(() => {});
                 try { pi.sendUserMessage(header("steer", job.from, selfId, job.id, job.text)); }
                 catch (error) {
                   finish(job, { status: "error", error: String(error) });
@@ -260,6 +263,7 @@ export default function (pi: ExtensionAPI) {
               } else {
                 btwQueue.push(job);
                 scheduleBtw();
+                void announce(ctx).catch(() => {});
               }
               response = request.delayed ? { status: "pending", requestId: id } : await awaitJob(job);
             } else if (request.action === "wait" && typeof request.requestId === "string") {
@@ -301,11 +305,30 @@ export default function (pi: ExtensionAPI) {
     await old.withdraw();
   }
 
+  async function targetCompletions(prefix: string, options: { delayed?: boolean; workspace?: boolean; listeningOnly?: boolean; includeSelf?: boolean } = {}) {
+    const input = prefix.trimStart();
+    const match = options.delayed ? input.match(/^(--delayed\s+)?([^\s]*)$/) : input.match(/^([^\s]*)$/);
+    if (!match) return null;
+    const delayedPrefix = options.delayed ? match[1] ?? "" : "";
+    const fragment = options.delayed ? match[2] : match[1];
+    const peers = await catalog.list();
+    const matches = peers.filter((peer) => (options.includeSelf || peer.id !== selfId) && (!options.listeningOnly || peer.listening) && peer.id.startsWith(fragment));
+    const items = matches.slice(0, 30).map((peer) => ({
+      value: `${delayedPrefix}${peer.id} `,
+      label: `${peer.id}${peer.name ? ` — ${peer.name}` : ""}`,
+      description: `${peer.workspaceId ? `Herdr ${peer.workspaceId} · ` : ""}${peer.listening ? peer.activity ?? "listening" : "not listening"}`,
+    }));
+    if (options.workspace && "ws".startsWith(fragment)) items.unshift({ value: "ws", label: "ws — current Herdr workspace", description: "Scope to this workspace" });
+    if (options.delayed && !delayedPrefix && "--delayed".startsWith(fragment)) items.unshift({ value: "--delayed ", label: "--delayed", description: "Return a request ID immediately" });
+    return items.length ? items : null;
+  }
+
   async function purposeFor(peer: PeerRecord): Promise<string> {
     const response = await exchange(peer.id, { action: "send", kind: "btw", from: selfId, text: PURPOSE_PROMPT, delayed: false });
     return describe(response).trim();
   }
 
+  pi.on("agent_start", (_event, ctx) => { void announce(ctx).catch(() => {}); });
   pi.on("agent_end", (event) => {
     if (!steerActive) return;
     const answer = [...event.messages].reverse().find((message) => message.role === "assistant");
@@ -359,6 +382,7 @@ export default function (pi: ExtensionAPI) {
   for (const kind of ["steer", "btw"] as const) {
     pi.registerCommand(`mesh:${kind}`, {
       description: `${kind === "steer" ? "Permanently steer" : "Ask a context-only question of"} a listening session; --delayed returns an ID`,
+      getArgumentCompletions: (prefix) => targetCompletions(prefix, { delayed: true, listeningOnly: true }),
       handler: async (args, ctx) => {
         try {
           const input = args.trim();
@@ -387,6 +411,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("mesh:wait", {
     description: "Wait up to 30 seconds for a delayed request: /mesh:wait <id> <request-id>",
+    getArgumentCompletions: (prefix) => targetCompletions(prefix),
     handler: async (args, ctx) => {
       try {
         const [id, requestId, ...extra] = args.trim().split(/\s+/);
@@ -422,6 +447,7 @@ export default function (pi: ExtensionAPI) {
   });
   pi.registerCommand("mesh:catalog:refresh", {
     description: "Refresh changed purposes for all sessions, the Herdr workspace (ws), or one ID",
+    getArgumentCompletions: (prefix) => targetCompletions(prefix, { workspace: true, includeSelf: true }),
     handler: async (args, ctx) => {
       const run = ++refreshRun;
       try {

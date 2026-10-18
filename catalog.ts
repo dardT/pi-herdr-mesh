@@ -18,6 +18,8 @@ export type PeerRecord = {
   workspaceId?: string;
   workspaceKey?: string;
   listening: boolean;
+  activity: "idle" | "busy" | "answering-btw";
+  queuedBtw: number;
   revision: string;
   purpose?: string;
   purposeRevision?: string;
@@ -134,7 +136,7 @@ async function revisionFor(ctx: ExtensionContext): Promise<string> {
   return "";
 }
 
-async function metadata(ctx: ExtensionContext, id: string, listening: boolean): Promise<Registration> {
+async function metadata(ctx: ExtensionContext, id: string, listening: boolean, activity: Registration["activity"], queuedBtw: number): Promise<Registration> {
   const cwd = ctx.cwd;
   let branch: string | undefined;
   try { branch = (await execFileAsync("git", ["-C", cwd, "symbolic-ref", "--short", "HEAD"])).stdout.trim() || undefined; }
@@ -150,6 +152,8 @@ async function metadata(ctx: ExtensionContext, id: string, listening: boolean): 
     ...(ctx.sessionManager.getSessionName() ? { name: ctx.sessionManager.getSessionName() } : {}),
     ...(workspaceKey ? { workspaceId: process.env.HERDR_WORKSPACE_ID, workspaceKey } : {}),
     listening,
+    activity,
+    queuedBtw,
     revision: await revisionFor(ctx),
   };
 }
@@ -159,9 +163,9 @@ export function createCatalog(selfId: string) {
   let version = 0;
 
   return {
-    async announce(ctx: ExtensionContext, listening: boolean): Promise<void> {
+    async announce(ctx: ExtensionContext, listening: boolean, activity: Registration["activity"] = ctx.isIdle() ? "idle" : "busy", queuedBtw = 0): Promise<void> {
       const currentVersion = ++version;
-      const record = await metadata(ctx, selfId, listening);
+      const record = await metadata(ctx, selfId, listening, activity, queuedBtw);
       if (currentVersion !== version) return;
       await withLock(async () => {
         if (currentVersion !== version) return;
@@ -189,8 +193,16 @@ export function createCatalog(selfId: string) {
     },
 
     async list(): Promise<PeerRecord[]> {
-      await secureDirectory();
-      return readSnapshot();
+      return withLock(async () => {
+        const previous = new Map((await readSnapshot()).map((peer) => [peer.id, peer]));
+        const peers = (await discover()).map((peer): PeerRecord => ({
+          ...peer,
+          purpose: previous.get(peer.id)?.purpose,
+          purposeRevision: previous.get(peer.id)?.purposeRevision,
+        }));
+        await saveSnapshot(peers);
+        return peers;
+      });
     },
 
     async refresh(
