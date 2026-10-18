@@ -1,42 +1,42 @@
-# Pi Mesh
+# Pi Herdr Mesh
 
 Local communication and discovery between Pi processes owned by the same OS user.
 
 Install as a Pi package from GitHub:
 
 ```sh
-pi install git:github.com/dardT/pi-mesh
+pi install git:github.com/dardT/pi-herdr-mesh
 ```
 
-Run `/reload` in existing Pi sessions after installing or updating. Remove any previously installed standalone copy before installing the package to avoid loading the extension twice. The manifest declares `@dardt/pi-mesh` for a future npm release; it is **not published to npm yet**.
+Run `/reload` in existing Pi sessions after installing or updating. If updating from `pi-mesh`, remove the old package or standalone copy first to avoid loading both extensions. Reload each session to get the new commands and tools; listening stops on reload, so run `/mesh:listen` again. The legacy commands and tool names are no longer registered. The manifest declares `@dardt/pi-herdr-mesh` for a future npm release; it is **not published to npm yet**.
 
 ## Commands
 
 | Command | Meaning |
 | --- | --- |
-| `/pi-mesh:listen [id]` | Opt in to receiving requests. Your catalog ID is generated at startup, or you can set a unique ID here. |
-| `/pi-mesh:listen off` | Stop accepting requests without leaving the catalog. Pending requests fail. |
-| `/pi-mesh:steer [--delayed] <id> <prompt>` | Start a normal turn in the target. Both request and answer **remain in its conversation**. Rejects a busy target. |
-| `/pi-mesh:btw [--delayed] <id> <question>` | Queue a tool-free, one-off model answer based on the target's finalized context. **Neither the question nor answer enters its conversation.** |
-| `/pi-mesh:wait <id> <request-id>` | Wait up to 30 seconds for a delayed steer or BTW reply; repeat if pending. |
-| `/pi-mesh:catalog` | Display **all** registered sessions under this OS user, across Herdr workspaces, with this session marked `← you`. |
-| `/pi-mesh:catalog ws` | Display only sessions in the current Herdr workspace (on this Herdr server). The quoted spelling `"ws"` also works. |
-| `/pi-mesh:catalog:refresh` | Sync the catalog; refresh changed purposes across all listening sessions. |
-| `/pi-mesh:catalog:refresh ws` | Sync the catalog; refresh changed purposes only for listening sessions in the current Herdr workspace (on this Herdr server). The quoted spelling `"ws"` also works. Requires a Herdr-managed pane. |
-| `/pi-mesh:catalog:refresh <id>` | Sync the catalog; refresh the changed purpose for just that session. |
+| `/mesh:listen [id]` | Opt in to receiving requests. Your catalog ID is generated at startup, or you can set a unique ID here. |
+| `/mesh:listen off` | Stop accepting requests without leaving the catalog. Pending requests fail. |
+| `/mesh:steer [--delayed] <id> <prompt>` | Start a normal turn in the target. Both request and answer **remain in its conversation**. Rejects a busy target. |
+| `/mesh:btw [--delayed] <id> <question>` | Queue a tool-free, one-off model answer based on the target's finalized context. **Neither the question nor answer enters its conversation.** |
+| `/mesh:wait <id> <request-id>` | Wait up to 30 seconds for a delayed steer or BTW reply; repeat if pending. |
+| `/mesh:catalog` | Display **all** registered sessions under this OS user, across Herdr workspaces, with this session marked `← you`. |
+| `/mesh:catalog ws` | Display only sessions in the current Herdr workspace (on this Herdr server). The quoted spelling `"ws"` also works. |
+| `/mesh:catalog:refresh` | Sync the catalog; refresh changed purposes across all listening sessions. |
+| `/mesh:catalog:refresh ws` | Sync the catalog; refresh changed purposes only for listening sessions in the current Herdr workspace (on this Herdr server). The quoted spelling `"ws"` also works. Requires a Herdr-managed pane. |
+| `/mesh:catalog:refresh <id>` | Sync the catalog; refresh the changed purpose for just that session. |
 
 In the interactive TUI, catalog refresh shows a footer progress bar while it discovers sessions and queries changed purposes. The counter tracks attempted purpose queries (including failures), not every catalog row; the bar clears on completion or error. A refresh with nothing to query can finish too quickly to notice the bar.
 
-Every process running the extension registers in the catalog, but **only `/pi-mesh:listen` allows incoming requests or purpose queries**. The catalog is not a system-wide process scanner: already-running Pi processes must `/reload` (or restart) to load Pi Mesh before they appear. Sessions under another OS account are intentionally excluded. A sender does not need to listen; its catalog ID identifies it in the extension-generated header delivered to the target. The header also includes the target ID, request ID, and whether the request is `steer` or `btw`. Sender-provided text is explicitly delimited and does not change the target's standing purpose merely by being sent.
+Every process running the extension registers in the catalog, but **only `/mesh:listen` allows incoming requests or purpose queries**. The catalog is not a system-wide process scanner: already-running Pi processes must `/reload` (or restart) to load Pi Herdr Mesh before they appear. Sessions under another OS account are intentionally excluded. A sender does not need to listen; its catalog ID identifies it in the extension-generated header delivered to the target. The header also includes the target ID, request ID, and whether the request is `steer` or `btw`. Sender-provided text is explicitly delimited and does not change the target's standing purpose merely by being sent.
 
-Agent tools: `pi_mesh_steer({ id, text, delayed? })`, `pi_mesh_btw({ id, text, delayed? })`, `pi_mesh_wait({ id, requestId })`, and read-only `pi_mesh_catalog({})`. Tool results enter the **sender's** calling agent context. Slash-command replies display without starting a new sender turn. `--delayed` returns a request ID immediately; blocking requests have no processing deadline and stop when the listener disconnects. `/pi-mesh:btw` queues until the target is idle, then processes one request at a time; its answer may incur a full-context model call, but it does not run tools or persist messages in the target.
+Agent tools: `mesh_steer({ id, text, delayed? })`, `mesh_btw({ id, text, delayed? })`, `mesh_wait({ id, requestId })`, and read-only `mesh_catalog({})`. Tool results enter the **sender's** calling agent context. Slash-command replies display without starting a new sender turn. `--delayed` returns a request ID immediately; blocking requests have no processing deadline and stop when the listener disconnects. `/mesh:btw` queues until the target is idle, then processes one request at a time; its answer may incur a full-context model call, but it does not run tools or persist messages in the target.
 
 Catalog purposes are generated by these same context-only queries, not inferred on startup. Catalog refresh does not query non-listening sessions, and does not re-query unchanged conversations. Purpose generation costs a model call per changed listening session; a model failure leaves the prior purpose available for retry. BTW and purpose calls are billed as direct model requests, but their usage is not recorded in the target's Pi session transcript. Prompt-cache hits depend on the provider and the unchanged prompt prefix and are not guaranteed. If the target's model has no credentials, BTW and purpose refresh can fail. A catalog row may retain stale purpose until refreshed.
 
-IDs consist of letters, digits, underscores, or hyphens, start with a letter or digit, and have a maximum length of 64 characters. `ws` is reserved for workspace refresh. IDs must be unique among running Pi Mesh instances. Request IDs are separate UUIDs, available until the listener stops or evicts old completed results (up to 100 retained). Listening stops on session replacement, reload, or exit; the new session must opt in again.
+IDs consist of letters, digits, underscores, or hyphens, start with a letter or digit, and have a maximum length of 64 characters. `ws` is reserved for workspace refresh. IDs must be unique among running Pi Herdr Mesh instances. Request IDs are separate UUIDs, available until the listener stops or evicts old completed results (up to 100 retained). Listening stops on session replacement, reload, or exit; the new session must opt in again.
 
 ## Local transport and caveats
 
-The extension uses Unix-domain sockets and catalog files in a private (0700) temporary directory under the current OS user, with socket and file permissions 0600. It opens no TCP ports. It cannot protect against malicious code running under the same OS account. Requests and replies are capped at 1 MiB. An outgoing request may appear in the sender's own history (especially if sent by an agent tool); **BTW isolation applies to the target only**. Concurrent edits to the target's project by other processes are outside this guarantee.
+The extension uses Unix-domain sockets and catalog files in a private (0700) temporary directory under the current OS user, with socket and file permissions 0600. The transport directory retains its previous `pi-mesh-<uid>` name for compatibility with running listeners and to keep Unix-socket paths short on macOS. It opens no TCP ports. It cannot protect against malicious code running under the same OS account. Requests and replies are capped at 1 MiB. An outgoing request may appear in the sender's own history (especially if sent by an agent tool); **BTW isolation applies to the target only**. Concurrent edits to the target's project by other processes are outside this guarantee.
 
-Blocking calls can deadlock in cyclic workflows (for example, A waits for B while B waits for A). Use `--delayed` and `/pi-mesh:wait` when coordinating cycles. A queued BTW request waits for the target to settle; there is no automatic deadline for the entire request.
+Blocking calls can deadlock in cyclic workflows (for example, A waits for B while B waits for A). Use `--delayed` and `/mesh:wait` when coordinating cycles. A queued BTW request waits for the target to settle; there is no automatic deadline for the entire request.
