@@ -167,6 +167,7 @@ export default function (pi: ExtensionAPI) {
   let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
   let btwRunning = false;
   let btwAbort: AbortController | undefined;
+  let btwRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let listenerContext: ExtensionContext | undefined;
   const btwQueue: Job[] = [];
   const jobs = new Map<string, Job>();
@@ -210,8 +211,15 @@ export default function (pi: ExtensionAPI) {
   }
 
   function scheduleBtw() {
+    if (btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
     const ctx = listenerContext;
-    if (!ctx || !server || btwRunning || steerActive || !ctx.isIdle() || !btwQueue.length) return;
+    if (!ctx || !server || !btwQueue.length) return;
+    if (btwRunning || steerActive || !ctx.isIdle()) {
+      // A run can become idle without a usable settlement callback (e.g. a
+      // failed startup or compaction). Keep queued requests live until it does.
+      btwRetryTimer = setTimeout(scheduleBtw, 1_000);
+      return;
+    }
     const job = btwQueue.shift()!;
     btwRunning = true;
     void announce(ctx).catch(() => {});
@@ -236,6 +244,7 @@ export default function (pi: ExtensionAPI) {
     listenerContext = undefined;
     ctx.ui.setStatus("pi-mesh", undefined);
     btwAbort?.abort();
+    if (btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
     btwQueue.length = 0;
     for (const job of jobs.values()) finish(job, { status: "error", error: "Listener stopped" });
     jobs.clear();
@@ -286,7 +295,10 @@ export default function (pi: ExtensionAPI) {
             const request = JSON.parse(buffer.slice(0, end)) as Request;
             if (request.action === "send" && (request.kind === "steer" || request.kind === "btw") && typeof request.text === "string" && typeof request.from === "string" && typeof request.delayed === "boolean") {
               if (!ID_PATTERN.test(request.from) || !request.text.trim()) throw new Error("Invalid sender ID or empty prompt");
-              if (request.kind === "steer" && (steerActive || btwRunning || btwQueue.length || !ctx.isIdle())) throw new Error("Listener is busy");
+              if (request.kind === "steer" && (steerActive || btwRunning || btwQueue.length || !ctx.isIdle())) {
+                const reason = steerActive ? "another steer" : btwRunning ? "answering BTW" : btwQueue.length ? "queued BTW" : "an agent run or compaction";
+                throw new Error(`Listener is busy (${reason})`);
+              }
               if (jobs.size >= MAX_RESULTS) {
                 for (const [key, job] of jobs) { if (job.result) { jobs.delete(key); break; } }
                 if (jobs.size >= MAX_RESULTS) throw new Error("Listener request limit reached");
@@ -322,6 +334,7 @@ export default function (pi: ExtensionAPI) {
               const index = job.kind === "btw" && !job.result ? btwQueue.indexOf(job) : -1;
               if (index < 0) throw new Error("Request already started or finished; cannot cancel at target");
               btwQueue.splice(index, 1);
+              if (!btwQueue.length && btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
               finish(job, { status: "error", error: "Queued BTW cancelled by sender" });
               void announce(ctx).catch(() => {});
               response = { status: "done", text: "Queued BTW cancelled at target" };
@@ -572,7 +585,11 @@ export default function (pi: ExtensionAPI) {
           }));
           for (const request of requests.list()) requests.dismiss(request.id);
           ctx.ui.notify(`Left the mesh${pendingBtw.length ? `; attempted to cancel ${pendingBtw.length} pending BTW request(s). Started work cannot be undone.` : ""}`, "info");
-        } else if (action === "status") ctx.ui.notify(member ? `In the mesh as ${selfId} (listening)` : "Outside the mesh", "info");
+        } else if (action === "status") {
+          if (!member) return ctx.ui.notify("Outside the mesh", "info");
+          const blocked = steerActive ? `steer ${steerActive.id}` : btwRunning ? "another BTW" : ctx.isIdle() ? "nothing (idle)" : "an agent run or compaction";
+          ctx.ui.notify(`In the mesh as ${selfId} (listening) · BTW blocked by: ${blocked}\nIncoming BTW queue (${btwQueue.length})`, "info");
+        }
         else throw new Error("Usage: /mesh [on|off|status]");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
     },
