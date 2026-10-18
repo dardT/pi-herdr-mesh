@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "@earendil-works/pi-ai";
 import { buildSessionContext, convertToLlm, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js";
 import { createRequestTracker, type RequestRecord } from "./requests.js";
 
@@ -24,6 +25,7 @@ type Request =
   | { action: "wait"; requestId: string }
   | { action: "cancel"; requestId: string; from: string };
 type Job = { id: string; kind: Kind; from: string; text: string; result?: Response; waiters: Set<(response: Response) => void> };
+type BtwReceipt = { id: string; from: string; text: string };
 
 type OmCompaction = {
   sessionId: string;
@@ -155,6 +157,13 @@ function formatCatalog(peers: PeerRecord[], selfId: string, scope: "all" | "ws" 
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.registerEntryRenderer<BtwReceipt>("pi-mesh-btw-received", (entry, _options, theme) => {
+    if (!entry.data) return undefined;
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(`${theme.fg("accent", "[mesh / btw received]")} From: ${entry.data.from} · Request-ID: ${entry.data.id}\n${entry.data.text}`, 0, 0));
+    return box;
+  });
+
   let selfId = randomUUID().slice(0, 8);
   let catalog = createCatalog(selfId);
   let refreshRun = 0;
@@ -332,6 +341,8 @@ export default function (pi: ExtensionAPI) {
               }
               const id = randomUUID();
               const job: Job = { id, kind: request.kind, from: request.from, text: request.text, waiters: new Set() };
+              // Custom entries remain visible in the target transcript but never enter LLM context.
+              if (request.kind === "btw") pi.appendEntry<BtwReceipt>("pi-mesh-btw-received", { id, from: job.from, text: job.text });
               jobs.set(id, job);
               if (request.kind === "steer") {
                 steerActive = job;
