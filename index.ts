@@ -29,6 +29,7 @@ type Request =
 type Job = { id: string; kind: Kind; from: string; text: string; result?: Response; waiters: Set<(response: Response) => void> };
 type BtwReceipt = { id: string; from: string; text: string };
 
+type BtwAnswer = { id: string; from: string; text: string };
 type OmCompaction = {
   sessionId: string;
   attemptId: string;
@@ -164,6 +165,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   let selfId = randomUUID().slice(0, 8);
+  pi.registerEntryRenderer<BtwAnswer>("pi-mesh-btw-answered", (entry, { expanded }, theme) => {
+    if (!entry.data) return undefined;
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    const summary = entry.data.text.replace(/\s+/g, " ").trim();
+    const answer = expanded ? entry.data.text : `${summary.slice(0, 120)}${summary.length > 120 ? "…" : ""} ${theme.fg("dim", "(expand for full answer)")}`;
+    box.addChild(new Text(`${theme.fg("accent", "[mesh / btw answered]")} To: ${entry.data.from} · Request-ID: ${entry.data.id}\n${answer}`, 0, 0));
+    return box;
+  });
+
   let catalog = createCatalog(selfId);
   let server: Server | undefined;
   let member = false;
@@ -237,7 +247,10 @@ export default function (pi: ExtensionAPI) {
       // Deliberately no tools: BTW is a one-off, tool-free answer, not an agent turn.
     }, { reasoning: ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel, signal: signal.signal }).result();
     if (result.stopReason === "error" || result.stopReason === "aborted") throw new Error(result.errorMessage ?? "BTW answer failed");
-    finish(job, { status: "done", text: result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n") });
+    const text = result.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+    if (job.result) return; // The listener may have stopped while the model was answering.
+    pi.appendEntry<BtwAnswer>("pi-mesh-btw-answered", { id: job.id, from: job.from, text });
+    finish(job, { status: "done", text });
   }
 
   function scheduleBtw() {
