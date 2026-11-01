@@ -9,7 +9,8 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js";
 import { createRequestTracker, type RequestRecord } from "./requests.js";
 import { clearMetadataMatch, rankPeers } from "./routing.js";
-import { joinByDefault } from "./settings.js";
+import { meshSettings, type MeshSettings } from "./settings.js";
+import { createSteeringCoordinator } from "./steering.js";
 
 const WAIT_MS = 30_000;
 const MAX_BYTES = 1024 * 1024;
@@ -28,8 +29,8 @@ type Request =
   | { action: "cancel"; requestId: string; from: string };
 type Job = { id: string; kind: Kind; from: string; text: string; result?: Response; waiters: Set<(response: Response) => void> };
 type BtwReceipt = { id: string; from: string; text: string };
-
 type BtwAnswer = { id: string; from: string; text: string };
+
 type OmCompaction = {
   sessionId: string;
   attemptId: string;
@@ -164,7 +165,6 @@ export default function (pi: ExtensionAPI) {
     return box;
   });
 
-  let selfId = randomUUID().slice(0, 8);
   pi.registerEntryRenderer<BtwAnswer>("pi-mesh-btw-answered", (entry, { expanded }, theme) => {
     if (!entry.data) return undefined;
     const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
@@ -174,11 +174,14 @@ export default function (pi: ExtensionAPI) {
     return box;
   });
 
+  let selfId = randomUUID().slice(0, 8);
   let catalog = createCatalog(selfId);
   let server: Server | undefined;
   let member = false;
   let listenerId: string | undefined;
   let steerActive: Job | undefined;
+  let steering = createSteeringCoordinator<Job>("exclusive");
+  let settings: MeshSettings = { joinByDefault: false, steeringMode: "exclusive" };
   let lastAnswer: Response | undefined;
   let terminalAnswer: Response | undefined;
   let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
@@ -188,6 +191,7 @@ export default function (pi: ExtensionAPI) {
   let membershipRun = 0;
   let btwAbort: AbortController | undefined;
   let btwRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let steeringRetryTimer: ReturnType<typeof setTimeout> | undefined;
   let listenerContext: ExtensionContext | undefined;
   const btwQueue: Job[] = [];
   const jobs = new Map<string, Job>();
@@ -215,6 +219,7 @@ export default function (pi: ExtensionAPI) {
     const activity = [
       activeBtw ? "BTW answering" : undefined,
       btwQueue.length ? `${btwQueue.length} BTW queued` : undefined,
+      steering.queued.length ? `${steering.queued.length} steer queued` : undefined,
       pending ? `${pending} BTW outgoing` : undefined,
     ].filter(Boolean).join(" · ");
     ctx.ui.setStatus("pi-mesh", `mesh ${selfId}${activity ? ` · ${activity}` : ""}`);
@@ -271,8 +276,37 @@ export default function (pi: ExtensionAPI) {
     void (async () => {
       try { await answerBtw(job, ctx); }
       catch (error) { finish(job, { status: "error", error: error instanceof Error ? error.message : String(error) }); }
-      finally { btwAbort = undefined; btwRunning = false; activeBtw = undefined; scheduleBtw(); updateMeshStatus(); void announce(ctx).catch(() => {}); }
+      finally { btwAbort = undefined; btwRunning = false; activeBtw = undefined; scheduleBtw(); scheduleSteer(); updateMeshStatus(); void announce(ctx).catch(() => {}); }
     })();
+  }
+
+  function startSteer(job: Job) {
+    steerActive = job;
+    lastAnswer = undefined;
+    terminalAnswer = undefined;
+    if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
+    steerCompaction = undefined;
+    if (listenerContext) void announce(listenerContext).catch(() => {});
+    try { pi.sendUserMessage(header("steer", job.from, selfId, job.id, job.text)); }
+    catch (error) {
+      finish(job, { status: "error", error: String(error) });
+      steerActive = undefined;
+      scheduleSteer();
+    }
+  }
+
+  function scheduleSteer() {
+    if (steeringRetryTimer) { clearTimeout(steeringRetryTimer); steeringRetryTimer = undefined; }
+    const ctx = listenerContext;
+    if (!ctx || !server || !steering.queued.length) return;
+    // BTW requests already waiting keep priority over queued steers.
+    if (steerActive || btwRunning || btwQueue.length || !ctx.isIdle()) {
+      steeringRetryTimer = setTimeout(scheduleSteer, 1_000);
+      return;
+    }
+    const job = steering.next()!;
+    startSteer(job);
+    updateMeshStatus();
   }
 
   async function stop(ctx: ExtensionContext) {
@@ -289,7 +323,9 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("pi-mesh", undefined);
     btwAbort?.abort();
     if (btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
+    if (steeringRetryTimer) { clearTimeout(steeringRetryTimer); steeringRetryTimer = undefined; }
     btwQueue.length = 0;
+    steering.clear();
     activeBtw = undefined;
     outgoingBtw = 0;
     for (const job of jobs.values()) finish(job, { status: "error", error: "Listener stopped" });
@@ -308,6 +344,7 @@ export default function (pi: ExtensionAPI) {
   async function listen(id: string, ctx: ExtensionContext) {
     if (server) throw new Error(`Already in the mesh as ${listenerId}; run /mesh off first`);
     if (id === "ws") throw new Error("ID ws is reserved");
+    const config = await meshSettings(ctx.cwd);
     const path = socketPath(id);
     await secureDirectory();
     try {
@@ -341,7 +378,8 @@ export default function (pi: ExtensionAPI) {
             const request = JSON.parse(buffer.slice(0, end)) as Request;
             if (request.action === "send" && (request.kind === "steer" || request.kind === "btw") && typeof request.text === "string" && typeof request.from === "string" && typeof request.delayed === "boolean") {
               if (!ID_PATTERN.test(request.from) || !request.text.trim()) throw new Error("Invalid sender ID or empty prompt");
-              if (request.kind === "steer" && (steerActive || btwRunning || btwQueue.length || !ctx.isIdle())) {
+              const busy = !!steerActive || btwRunning || !!btwQueue.length || !ctx.isIdle();
+              if (request.kind === "steer" && settings.steeringMode === "exclusive" && busy) {
                 const reason = steerActive ? "another steer" : btwRunning ? "answering BTW" : btwQueue.length ? "queued BTW" : "an agent run or compaction";
                 throw new Error(`Listener is busy (${reason})`);
               }
@@ -355,17 +393,10 @@ export default function (pi: ExtensionAPI) {
               if (request.kind === "btw") pi.appendEntry<BtwReceipt>("pi-mesh-btw-received", { id, from: job.from, text: job.text });
               jobs.set(id, job);
               if (request.kind === "steer") {
-                steerActive = job;
-                lastAnswer = undefined;
-                terminalAnswer = undefined;
-                if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
-                steerCompaction = undefined;
-                void announce(ctx).catch(() => {});
-                try { pi.sendUserMessage(header("steer", job.from, selfId, job.id, job.text)); }
-                catch (error) {
-                  finish(job, { status: "error", error: String(error) });
-                  steerActive = undefined;
-                }
+                const admission = steering.admit(job, busy);
+                if (admission === "rejected") throw new Error("Listener is busy");
+                if (admission === "start") startSteer(job);
+                else { scheduleSteer(); updateMeshStatus(); }
               } else {
                 btwQueue.push(job);
                 scheduleBtw();
@@ -381,13 +412,15 @@ export default function (pi: ExtensionAPI) {
               const job = jobs.get(request.requestId);
               if (!job || job.from !== request.from) throw new Error("Unknown request ID for sender");
               const index = job.kind === "btw" && !job.result ? btwQueue.indexOf(job) : -1;
-              if (index < 0) throw new Error("Request already started or finished; cannot cancel at target");
-              btwQueue.splice(index, 1);
+              const cancelledSteer = job.kind === "steer" && !job.result && steering.cancel(job);
+              if (index < 0 && !cancelledSteer) throw new Error("Request already started or finished; cannot cancel at target");
+              if (index >= 0) btwQueue.splice(index, 1);
               if (!btwQueue.length && btwRetryTimer) { clearTimeout(btwRetryTimer); btwRetryTimer = undefined; }
               updateMeshStatus();
-              finish(job, { status: "error", error: "Queued BTW cancelled by sender" });
+              finish(job, { status: "error", error: `Queued ${job.kind} cancelled by sender` });
               void announce(ctx).catch(() => {});
-              response = { status: "done", text: "Queued BTW cancelled at target" };
+              scheduleSteer();
+              response = { status: "done", text: `Queued ${job.kind} cancelled at target` };
             } else throw new Error("Invalid request");
           } catch (error) {
             response = { status: "error", error: error instanceof Error ? error.message : String(error) };
@@ -403,6 +436,8 @@ export default function (pi: ExtensionAPI) {
       });
       await chmod(path, 0o600);
     } catch (error) { next.close(); throw error; }
+    settings = config;
+    steering = createSteeringCoordinator<Job>(config.steeringMode);
     server = next;
     member = true;
     listenerId = id;
@@ -520,6 +555,7 @@ export default function (pi: ExtensionAPI) {
     steerCompaction = undefined;
     if (listenerContext) void announce(listenerContext).catch(() => {});
     scheduleBtw();
+    scheduleSteer();
   }
 
   // OM publishes its intent before compact() aborts the original run. Pi's ordinary
@@ -555,7 +591,7 @@ export default function (pi: ExtensionAPI) {
     await setSessionIdentity(ctx);
     if (member) return;
     try {
-      if (await joinByDefault(ctx.cwd)) await listen(selfId, ctx);
+      if ((await meshSettings(ctx.cwd)).joinByDefault) await listen(selfId, ctx);
     } catch (error) {
       ctx.ui.notify(`Mesh auto-join failed: ${String(error)}`, "warning");
     }
@@ -605,6 +641,7 @@ export default function (pi: ExtensionAPI) {
     }
     void announce(ctx).catch(() => {});
     scheduleBtw();
+    scheduleSteer();
   });
   pi.on("session_info_changed", (_event, ctx) => { void announce(ctx).catch(() => {}); });
   pi.on("session_shutdown", async (_event, ctx) => {
@@ -629,15 +666,15 @@ export default function (pi: ExtensionAPI) {
         } else if (action === "off") {
           if (!member) return ctx.ui.notify("Already outside the mesh", "info");
           await stop(ctx);
-          const pendingBtw = requests.list().filter((request) => request.state === "pending" && request.kind === "btw");
-          await Promise.allSettled(pendingBtw.map(async (request) => {
+          const pendingRequests = requests.list().filter((request) => request.state === "pending");
+          await Promise.allSettled(pendingRequests.map(async (request) => {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 2_000);
             try { await cancelTracked(request.id, controller.signal); }
             finally { clearTimeout(timer); }
           }));
           for (const request of requests.list()) requests.dismiss(request.id);
-          ctx.ui.notify(`Left the mesh${pendingBtw.length ? `; attempted to cancel ${pendingBtw.length} pending BTW request(s). Started work cannot be undone.` : ""}`, "info");
+          ctx.ui.notify(`Left the mesh${pendingRequests.length ? `; attempted to cancel ${pendingRequests.length} queued request(s). Started work cannot be undone.` : ""}`, "info");
         } else if (action === "status") {
           if (!member) return ctx.ui.notify("Outside the mesh", "info");
           const active = activeBtw ? `\nAnswering BTW: ${activeBtw.id} ← ${activeBtw.from}` : "";
@@ -645,7 +682,8 @@ export default function (pi: ExtensionAPI) {
             ? btwQueue.map((job, index) => `  ${index + 1}. ${job.id} ← ${job.from}`).join("\n")
             : "  (none)";
           const blocked = steerActive ? `steer ${steerActive.id}` : btwRunning ? "another BTW" : ctx.isIdle() ? "nothing (idle)" : "an agent run or compaction";
-          ctx.ui.notify(`In the mesh as ${selfId} (listening) · BTW blocked by: ${blocked}${active}\nIncoming BTW queue (${btwQueue.length}):\n${queued}`, "info");
+          const steers = steering.queued.map((job, index) => `  ${index + 1}. ${job.id} ← ${job.from}`).join("\n") || "  (none)";
+          ctx.ui.notify(`In the mesh as ${selfId} (listening) · steering: ${settings.steeringMode} · BTW blocked by: ${blocked}${active}\nIncoming BTW queue (${btwQueue.length}):\n${queued}\nIncoming steer queue (${steering.queued.length}):\n${steers}`, "info");
         }
         else throw new Error("Usage: /mesh [on|off|status]");
       } catch (error) { ctx.ui.notify(String(error), "error"); }
@@ -705,7 +743,7 @@ export default function (pi: ExtensionAPI) {
       name: `mesh_${kind}`,
       label: `${kind === "steer" ? "Steer" : "Ask BTW"} Pi session`,
       description: kind === "steer"
-        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer."
+        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer in exclusive mode, or queue it in FIFO mode."
         : "Requires the caller to join with /mesh on. Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
       parameters: Type.Object({ id: Type.String(), text: Type.String(), delayed: Type.Optional(Type.Boolean()) }),
       async execute(_callId, args, signal, _onUpdate, ctx) {
@@ -809,7 +847,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "mesh_cancel",
     label: "Cancel or dismiss delayed mesh request",
-    description: "While joined to the mesh, cancel a queued BTW at the target if it has not started. Running BTW or steer cannot be undone: dismiss local tracking only. Uses the request ID returned by a delayed send.",
+    description: "While joined to the mesh, cancel a queued BTW or steer at the target if it has not started. Running requests cannot be undone: dismiss local tracking only. Uses the request ID returned by a delayed send.",
     parameters: Type.Object({ requestId: Type.String() }),
     async execute(_callId, args) {
       requireMembership();
