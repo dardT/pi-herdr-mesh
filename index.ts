@@ -10,6 +10,7 @@ import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js"
 import { createRequestTracker, type RequestRecord } from "./requests.js";
 import { clearMetadataMatch, rankPeers } from "./routing.js";
 import { meshSettings, type MeshSettings } from "./settings.js";
+import { groupPrompt, splitGroupAnswer } from "./steering-group.js";
 import { createSteeringCoordinator } from "./steering.js";
 
 const WAIT_MS = 30_000;
@@ -181,7 +182,8 @@ export default function (pi: ExtensionAPI) {
   let listenerId: string | undefined;
   let steerActive: Job | undefined;
   let steering = createSteeringCoordinator<Job>("exclusive");
-  let settings: MeshSettings = { joinByDefault: false, steeringMode: "exclusive" };
+  let steerGroup: Job[] = [];
+  let settings: MeshSettings = { joinByDefault: false, steeringMode: "exclusive", groupWindowMs: 500 };
   let lastAnswer: Response | undefined;
   let terminalAnswer: Response | undefined;
   let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
@@ -280,17 +282,20 @@ export default function (pi: ExtensionAPI) {
     })();
   }
 
-  function startSteer(job: Job) {
+  function startSteer(group: Job[]) {
+    const job = group[0];
     steerActive = job;
+    steerGroup = group;
     lastAnswer = undefined;
     terminalAnswer = undefined;
     if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
     steerCompaction = undefined;
     if (listenerContext) void announce(listenerContext).catch(() => {});
-    try { pi.sendUserMessage(header("steer", job.from, selfId, job.id, job.text)); }
+    try { pi.sendUserMessage(group.length === 1 ? header("steer", job.from, selfId, job.id, job.text) : groupPrompt(group, selfId)); }
     catch (error) {
-      finish(job, { status: "error", error: String(error) });
+      for (const request of group) finish(request, { status: "error", error: String(error) });
       steerActive = undefined;
+      steerGroup = [];
       scheduleSteer();
     }
   }
@@ -304,8 +309,12 @@ export default function (pi: ExtensionAPI) {
       steeringRetryTimer = setTimeout(scheduleSteer, 1_000);
       return;
     }
-    const job = steering.next()!;
-    startSteer(job);
+    if (steering.readyInMs > 0) {
+      steeringRetryTimer = setTimeout(scheduleSteer, steering.readyInMs);
+      return;
+    }
+    const group = steering.nextBatch();
+    if (group.length) startSteer(group);
     updateMeshStatus();
   }
 
@@ -326,6 +335,7 @@ export default function (pi: ExtensionAPI) {
     if (steeringRetryTimer) { clearTimeout(steeringRetryTimer); steeringRetryTimer = undefined; }
     btwQueue.length = 0;
     steering.clear();
+    steerGroup = [];
     activeBtw = undefined;
     outgoingBtw = 0;
     for (const job of jobs.values()) finish(job, { status: "error", error: "Listener stopped" });
@@ -395,7 +405,7 @@ export default function (pi: ExtensionAPI) {
               if (request.kind === "steer") {
                 const admission = steering.admit(job, busy);
                 if (admission === "rejected") throw new Error("Listener is busy");
-                if (admission === "start") startSteer(job);
+                if (admission === "start") startSteer([job]);
                 else { scheduleSteer(); updateMeshStatus(); }
               } else {
                 btwQueue.push(job);
@@ -437,7 +447,7 @@ export default function (pi: ExtensionAPI) {
       await chmod(path, 0o600);
     } catch (error) { next.close(); throw error; }
     settings = config;
-    steering = createSteeringCoordinator<Job>(config.steeringMode);
+    steering = createSteeringCoordinator<Job>(config.steeringMode, config.groupWindowMs);
     server = next;
     member = true;
     listenerId = id;
@@ -547,8 +557,19 @@ export default function (pi: ExtensionAPI) {
 
   function finishSteer(result: Response) {
     if (!steerActive) return;
-    finish(steerActive, result);
+    if (steerGroup.length <= 1 || result.status !== "done") {
+      for (const job of steerGroup) finish(job, result);
+    } else {
+      try {
+        const replies = splitGroupAnswer(result.text, steerGroup.map((job) => job.id));
+        const byId = new Map(replies.map((reply) => [reply.id, reply.text]));
+        for (const job of steerGroup) finish(job, { status: "done", text: byId.get(job.id)! });
+      } catch (error) {
+        for (const job of steerGroup) finish(job, { status: "error", error: error instanceof Error ? error.message : String(error) });
+      }
+    }
     steerActive = undefined;
+    steerGroup = [];
     lastAnswer = undefined;
     terminalAnswer = undefined;
     if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
@@ -743,7 +764,7 @@ export default function (pi: ExtensionAPI) {
       name: `mesh_${kind}`,
       label: `${kind === "steer" ? "Steer" : "Ask BTW"} Pi session`,
       description: kind === "steer"
-        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer in exclusive mode, or queue it in FIFO mode."
+        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer in exclusive mode, or queue it in FIFO or sender-group mode."
         : "Requires the caller to join with /mesh on. Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
       parameters: Type.Object({ id: Type.String(), text: Type.String(), delayed: Type.Optional(Type.Boolean()) }),
       async execute(_callId, args, signal, _onUpdate, ctx) {

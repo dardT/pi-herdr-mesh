@@ -29,10 +29,10 @@ Use `/mesh off` to leave. While off, a session can list the catalog but cannot s
 Participation is opt-in by default. Configure automatic joining and the target-side steering policy in `~/.pi/agent/mesh/settings.json`:
 
 ```json
-{ "joinByDefault": true, "steeringMode": "fifo" }
+{ "joinByDefault": true, "steeringMode": "sender-group", "groupWindowMs": 500 }
 ```
 
-`steeringMode` defaults to `"exclusive"` (reject competing steers); `"fifo"` queues them until the target is idle. A project can override either setting with `.mesh/settings.json`. Pi resolves each setting from the nearest project file, then the user-wide file, then its default. Settings are read when joining or reloading; invalid settings warn and prevent automatic joining.
+`steeringMode` defaults to `"exclusive"` (reject competing steers). `"fifo"` queues individual requests. `"sender-group"` collects requests from the same sender for one target turn, with a separate reply for each request ID; it waits `groupWindowMs` (default 500 ms, allowed 100–10000 ms) before starting each group, and groups up to 10 requests per turn. A malformed grouped reply fails all requests in that group rather than guessing which answer belongs to which request. A project can override each setting with `.mesh/settings.json`. Pi resolves each setting from the nearest project file, then the user-wide file, then its default. Settings are read when joining or reloading; invalid settings warn and prevent automatic joining.
 
 ## Commands
 
@@ -42,7 +42,7 @@ Participation is opt-in by default. Configure automatic joining and the target-s
 | `/mesh off` | Leave the mesh and cancel queued outgoing BTW requests when possible. |
 | `/mesh status` | Show membership, steering policy, and incoming request queues. |
 | `/mesh:catalog [--all]` | List listening sessions. By default, scope to the current Herdr workspace; use `--all` for every local workspace. |
-| `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject it in exclusive mode or queue it in FIFO mode. |
+| `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject it in exclusive mode, or queue it in FIFO or sender-group mode. |
 | `/mesh:btw` | Queue a context-only, tool-free question until the recipient is idle. |
 | `/mesh:requests [request-id]` | Inspect background requests, wait for a response, or cancel/dismiss local tracking. |
 
@@ -60,7 +60,7 @@ The picker starts in the current Herdr workspace and can expand to all workspace
 | `mesh_requests({ requestId? })` | List locally tracked delayed requests or retrieve a saved result. |
 | `mesh_cancel({ requestId })` | Cancel a queued BTW request where possible, or dismiss local tracking. |
 
-BTW requests run one at a time when the target is idle. Waiting BTW requests take priority over queued FIFO steers; a continuous stream of BTWs can delay those steers. The target transcript shows the question and a compact answer preview; use Pi's tool-output expansion toggle (`Ctrl+O` by default) to view the full answer. Expansion applies to the transcript, not just one BTW entry. These entries are not sent to the target model. Pass `delayed: true` to send in the background: it returns a request ID and delivers the reply to the sender. Tracking is in-memory and ends if the sender reloads, leaves, or exits.
+BTW requests run one at a time when the target is idle. Waiting BTW requests take priority over queued steers; a continuous stream of BTWs can delay those steers. The target transcript shows the question and a compact answer preview; use Pi's tool-output expansion toggle (`Ctrl+O` by default) to view the full answer. Expansion applies to the transcript, not just one BTW entry. These entries are not sent to the target model. Pass `delayed: true` to send in the background: it returns a request ID and delivers the reply to the sender. Tracking is in-memory and ends if the sender reloads, leaves, or exits.
 
 ## Operational notes
 
@@ -68,4 +68,4 @@ Mesh IDs are stable for a saved Pi session and unique among running instances. A
 
 Transport uses a private `0700` temporary directory and `0600` Unix sockets under `pi-mesh-<uid>`. Messages and replies are limited to 1 MiB. It protects against other OS users, not malicious processes under the same account.
 
-Avoid circular blocking workflows: use a background request, then retrieve it with `/mesh:requests` or `mesh_wait`. Cancellation can remove a queued BTW or FIFO steer request; running requests continue while local tracking is dismissed. Incoming queues are in-memory and are cleared if the target leaves the mesh or exits.
+Avoid circular blocking workflows: use a background request, then retrieve it with `/mesh:requests` or `mesh_wait`. Cancellation can remove a queued BTW or steering request; running requests continue while local tracking is dismissed. Incoming queues are in-memory and are cleared if the target leaves the mesh or exits.
