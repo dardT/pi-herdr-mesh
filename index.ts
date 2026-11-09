@@ -10,7 +10,7 @@ import { createCatalog, herdrWorkspaceKey, type PeerRecord } from "./catalog.js"
 import { createRequestTracker, type RequestRecord } from "./requests.js";
 import { clearMetadataMatch, rankPeers } from "./routing.js";
 import { meshSettings, type MeshSettings } from "./settings.js";
-import { groupPrompt, splitGroupAnswer } from "./steering-group.js";
+import { multiRequestPrompt, splitGroupAnswer } from "./steering-group.js";
 import { createSteeringCoordinator } from "./steering.js";
 
 const WAIT_MS = 30_000;
@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI) {
     if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
     steerCompaction = undefined;
     if (listenerContext) void announce(listenerContext).catch(() => {});
-    try { pi.sendUserMessage(group.length === 1 ? header("steer", job.from, selfId, job.id, job.text) : groupPrompt(group, selfId)); }
+    try { pi.sendUserMessage(group.length === 1 ? header("steer", job.from, selfId, job.id, job.text) : multiRequestPrompt(group, selfId, "sender-group")); }
     catch (error) {
       for (const request of group) finish(request, { status: "error", error: String(error) });
       steerActive = undefined;
