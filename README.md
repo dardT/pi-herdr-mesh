@@ -1,71 +1,102 @@
 # Pi Herdr Mesh
 
-**Local discovery and communication for Pi sessions owned by the same OS user.**
-
-Pi Herdr Mesh lets independent Pi processes find one another, exchange lasting steering requests, and ask isolated context-only questions. It uses Unix-domain sockets, opens no network ports, and works across panes in a Herdr workspace.
+Connect local Pi sessions to discover collaborators, send steering requests, and ask questions without interrupting their work. Mesh communicates through Unix-domain sockets between Pi processes owned by the same OS user; it opens no network ports. It works across panes in a Herdr workspace and can also find sessions outside Herdr.
 
 ## Install
-
-Install directly from GitHub:
 
 ```sh
 pi install git:github.com/dardT/pi-herdr-mesh
 ```
 
+`@dardt/pi-herdr-mesh` is reserved for a future npm release; it is not published. If upgrading from `pi-mesh`, remove the old package or standalone extension first.
 
-> `@dardt/pi-herdr-mesh` is reserved for a future npm release and is not yet published. If upgrading from `pi-mesh`, remove the old package or standalone extension first.
+## Get started
 
-## Quick start
+1. Run `/mesh on` in each Pi session that should participate.
+2. Run `/mesh:catalog` to find another listening session in your Herdr workspace.
+3. Run `/mesh:btw` to ask a question, or `/mesh:steer` to give the other session a lasting instruction.
+4. Select a recipient, write your request, then choose **Send & wait** or **Send in background**. Use `/mesh:requests` to inspect background requests.
 
-1. Run `/mesh on` in each session you want to connect (if not already set in default settings).
-2. Use `/mesh:catalog` to see listening sessions in the current Herdr workspace.
-3. Send `/mesh:steer` for a durable instruction or `/mesh:btw` for a tool-free, context-only question.
-4. Choose **Send & wait** or **Send in background**; track background work with `/mesh:requests`.
+Run `/mesh off` to leave. A session outside the mesh can still list the catalog but cannot send or receive requests.
 
-Use `/mesh off` to leave. While off, a session can list the catalog but cannot send or receive requests.
+### Choose the right request
 
-## Participation settings
+| Request | What happens at the recipient | When to use it |
+| --- | --- | --- |
+| **BTW** (`/mesh:btw`, `mesh_btw`) | Waits until the recipient is idle, then obtains a tool-free answer from its current context. The question and answer appear in its transcript but do **not** enter its working context. | Ask for a quick assessment without changing the recipient's task. |
+| **Steer** (`/mesh:steer`, `mesh_steer`) | Starts an ordinary agent turn. The instruction and response remain in the recipient's conversation; its usual tools are available. | Assign work or change the recipient's direction. |
 
-Participation is opt-in by default. Configure automatic joining and the target-side steering policy in `~/.pi/agent/mesh/settings.json`:
+The BTW answer appears as a compact preview in the recipient's transcript. Pi's tool-output expansion shortcut (`Ctrl+O` by default) reveals the full answer; this toggle applies to the transcript, not just one entry. BTW requests are answered one at a time. Waiting BTWs take priority over queued steers, so a steady stream of BTWs can delay them.
+
+## Configure participation and steering
+
+Joining is opt-in. To join automatically, create `~/.pi/agent/mesh/settings.json`:
 
 ```json
-{ "joinByDefault": true, "steeringMode": "sender-group", "groupWindowMs": 500 }
+{
+  "joinByDefault": true
+}
 ```
 
-`steeringMode` defaults to `"exclusive"` (reject competing steers). `"fifo"` queues individual requests. `"sender-group"` collects requests from the same sender for one target turn. `"batch"` collects requests across senders for one turn (without negotiation). Collection waits `groupWindowMs` or `batchWindowMs` respectively (both default to 500 ms, allowed 100–10000 ms), with at most 10 requests per turn. Each request retains its ID and gets a distinct reply; a malformed multi-request reply fails the entire group rather than guessing which answer belongs to which request. A project can override each setting with `.mesh/settings.json`. Pi resolves each setting from the nearest project file, then the user-wide file, then its default. Settings are read when joining or reloading; invalid settings warn and prevent automatic joining.
+You can also select how a **recipient** handles incoming steers. For example, to group requests from the same sender:
+
+```json
+{
+  "joinByDefault": true,
+  "steeringMode": "sender-group",
+  "groupWindowMs": 500
+}
+```
+
+| `steeringMode` | Behavior when a steer arrives | Collection window |
+| --- | --- | --- |
+| `"exclusive"` **(default)** | Start immediately if idle; reject competing steers. | None |
+| `"fifo"` | Queue steers and execute them individually in arrival order. | None |
+| `"sender-group"` | Queue steers; collect requests from the same sender and execute up to 10 in one turn. | `groupWindowMs` |
+| `"batch"` | Queue steers from any sender and execute up to 10 in one turn. There is **no negotiation** before execution. | `batchWindowMs` |
+
+Both windows default to **500 ms** and accept integers from **100 to 10,000 ms**. They apply only to their respective modes. In grouped and batched turns, each request keeps its own ID and receives its own answer. If the recipient does not produce a valid answer for every ID, the entire group fails rather than assigning an answer to the wrong request. In `"batch"` mode, the recipient's model sees requests from multiple senders together, and its answers may disclose information across requests. Use `"sender-group"` or `"fifo"` when requests must stay separate.
+
+For project-specific settings, create `.mesh/settings.json` in the project or a parent directory. Each setting is resolved independently: the nearest project value wins, followed by the user-wide value, then the default (`false` for `joinByDefault`, `"exclusive"` for `steeringMode`). Settings take effect when the session joins or reloads. Invalid values prevent automatic joining and produce a warning.
 
 ## Commands
 
-| Command | Description |
+| Command | Purpose |
 | --- | --- |
-| `/mesh` or `/mesh on` | Join the mesh and begin listening. |
-| `/mesh off` | Leave the mesh and cancel queued outgoing BTW requests when possible. |
-| `/mesh status` | Show membership, steering policy, and incoming request queues. |
-| `/mesh:catalog [--all]` | List listening sessions. By default, scope to the current Herdr workspace; use `--all` for every local workspace. |
-| `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject it in exclusive mode, or queue it in FIFO, sender-group, or batch mode. |
-| `/mesh:btw` | Queue a context-only, tool-free question until the recipient is idle. |
-| `/mesh:requests [request-id]` | Inspect background requests, wait for a response, or cancel/dismiss local tracking. |
+| `/mesh` or `/mesh on` | Join and begin listening. |
+| `/mesh off` | Leave, clear incoming queues, and attempt to cancel pending outgoing requests. Started work cannot be undone. |
+| `/mesh status` | Show your mesh ID, steering mode, active BTW, and incoming queues. |
+| `/mesh:catalog [--all]` | List sessions in the current Herdr workspace, or all local sessions with `--all`. |
+| `/mesh:btw` | Ask a context-only, tool-free question using the recipient picker. |
+| `/mesh:steer` | Send a lasting request using the recipient picker. Admission follows the recipient's steering mode. |
+| `/mesh:requests [request-id]` | Inspect background requests; wait, show a reply, or cancel/dismiss tracking. |
 
-The picker starts in the current Herdr workspace and can expand to all workspaces. Outside Herdr, it lists all local sessions. Recipients are shown by session name (or folder), mesh ID, branch, activity, and any purpose already recorded in the catalog; stale purposes are marked “last known.” Opening the picker does not refresh purposes or make model calls.
+The picker starts with sessions in your Herdr workspace and can expand to all workspaces. Outside Herdr, it lists all local sessions. Each recipient shows its name (or folder), mesh ID, branch, activity, and any recorded purpose. Stale purposes are labelled “last known.” Opening the picker does not call a model to refresh them.
 
-## Agent tools and routing
+## Agent tools
 
-| Tool | Description |
+| Tool | Purpose |
 | --- | --- |
-| `mesh_catalog({ all? })` | List listening sessions in the current Herdr workspace, or all local workspaces. |
-| `mesh_find({ query, all? })` | Rank task-relevant sessions before sending, selectively refreshing up to three stale purposes; it never selects one automatically. |
-| `mesh_steer({ id, text, delayed? })` | Send a lasting request that changes the target conversation and can use its usual tools. |
-| `mesh_btw({ id, text, delayed? })` | Ask an isolated, tool-free question. The question and answer appear in the target transcript but do not enter its working context. |
-| `mesh_wait({ id, requestId })` | Wait for a delayed request's result. |
-| `mesh_requests({ requestId? })` | List locally tracked delayed requests or retrieve a saved result. |
-| `mesh_cancel({ requestId })` | Cancel a queued BTW request where possible, or dismiss local tracking. |
+| `mesh_catalog({ all? })` | List local mesh sessions; `all: true` includes other Herdr workspaces. |
+| `mesh_find({ query, all? })` | Rank relevant recipients. It may refresh up to three stale purposes with model calls; it never chooses a recipient automatically. |
+| `mesh_btw({ id, text, delayed? })` | Ask an isolated question. |
+| `mesh_steer({ id, text, delayed? })` | Send a lasting steering request. |
+| `mesh_wait({ id, requestId })` | Wait up to 30 seconds for a background reply; may return pending. |
+| `mesh_requests({ requestId? })` | List tracked requests or retrieve a saved result. |
+| `mesh_cancel({ requestId })` | Cancel a queued BTW or steer where possible; otherwise dismiss local tracking. |
 
-BTW requests run one at a time when the target is idle. Waiting BTW requests take priority over queued steers; a continuous stream of BTWs can delay those steers. The target transcript shows the question and a compact answer preview; use Pi's tool-output expansion toggle (`Ctrl+O` by default) to view the full answer. Expansion applies to the transcript, not just one BTW entry. These entries are not sent to the target model. Pass `delayed: true` to send in the background: it returns a request ID and delivers the reply to the sender. Tracking is in-memory and ends if the sender reloads, leaves, or exits.
+`id` is the recipient's mesh ID from `mesh_catalog` or `mesh_find`. Sends wait for completion by default. Set `delayed: true` to get a request ID immediately; the sender watches for the reply in the background. For example:
 
-## Operational notes
+```text
+mesh_steer({ id: "recipient-id", text: "Review the current design and report any risks.", delayed: true })
+mesh_wait({ id: "recipient-id", requestId: "returned-request-id" })
+```
 
-Mesh IDs are stable for a saved Pi session and unique among running instances. A session must load the extension and join before it appears in the catalog; Mesh does not scan system processes. Membership is limited to the current OS user.
+Background replies are delivered to the sender automatically while tracking is active. `mesh_requests` can retrieve the saved result later. Tracking is in-memory and ends when the sender reloads, leaves the mesh, or exits. Cancelling a request only stops it at the recipient if it is **still queued**; running work continues even if the sender dismisses its local record. For workflows where two agents might wait on each other, send in the background rather than blocking both sides.
 
-Transport uses a private `0700` temporary directory and `0600` Unix sockets under `pi-mesh-<uid>`. Messages and replies are limited to 1 MiB. It protects against other OS users, not malicious processes under the same account.
+## Limits and security
 
-Avoid circular blocking workflows: use a background request, then retrieve it with `/mesh:requests` or `mesh_wait`. Cancellation can remove a queued BTW or steering request; running requests continue while local tracking is dismissed. Incoming queues are in-memory and are cleared if the target leaves the mesh or exits.
+- Both sessions must load the extension and join before they can exchange requests. Mesh does not scan system processes. Mesh IDs are stable for a saved Pi session and unique among running instances.
+- Incoming queues and completed results are held in memory. The recipient retains up to 100 requests/results at a time; when its capacity is exhausted by unfinished work, new requests are rejected. Leaving the mesh clears incoming queues.
+- Transport uses a private `0700` directory and `0600` Unix sockets under `pi-mesh-<uid>` in the system temporary directory. Requests and replies are limited to 1 MiB.
+- Isolation is between OS users, **not** between untrusted processes running as the same user. Use the mesh only with Pi sessions you trust.
