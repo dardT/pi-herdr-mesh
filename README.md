@@ -32,7 +32,7 @@ Participation is opt-in by default. Configure automatic joining and the target-s
 { "joinByDefault": true, "steeringMode": "sender-group", "groupWindowMs": 500 }
 ```
 
-`steeringMode` defaults to `"exclusive"` (reject competing steers). `"fifo"` queues individual requests. `"sender-group"` collects requests from the same sender for one target turn, with a separate reply for each request ID; it waits `groupWindowMs` (default 500 ms, allowed 100–10000 ms) before starting each group, and groups up to 10 requests per turn. A malformed grouped reply fails all requests in that group rather than guessing which answer belongs to which request. A project can override each setting with `.mesh/settings.json`. Pi resolves each setting from the nearest project file, then the user-wide file, then its default. Settings are read when joining or reloading; invalid settings warn and prevent automatic joining.
+`steeringMode` defaults to `"exclusive"` (reject competing steers). `"fifo"` queues individual requests. `"sender-group"` collects requests from the same sender for one target turn. `"batch"` collects requests across senders for one turn (without negotiation). Collection waits `groupWindowMs` or `batchWindowMs` respectively (both default to 500 ms, allowed 100–10000 ms), with at most 10 requests per turn. Each request retains its ID and gets a distinct reply; a malformed multi-request reply fails the entire group rather than guessing which answer belongs to which request. A project can override each setting with `.mesh/settings.json`. Pi resolves each setting from the nearest project file, then the user-wide file, then its default. Settings are read when joining or reloading; invalid settings warn and prevent automatic joining.
 
 ## Commands
 
@@ -42,7 +42,7 @@ Participation is opt-in by default. Configure automatic joining and the target-s
 | `/mesh off` | Leave the mesh and cancel queued outgoing BTW requests when possible. |
 | `/mesh status` | Show membership, steering policy, and incoming request queues. |
 | `/mesh:catalog [--all]` | List listening sessions. By default, scope to the current Herdr workspace; use `--all` for every local workspace. |
-| `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject it in exclusive mode, or queue it in FIFO or sender-group mode. |
+| `/mesh:steer` | Send a lasting request to a listening session. Busy recipients reject it in exclusive mode, or queue it in FIFO, sender-group, or batch mode. |
 | `/mesh:btw` | Queue a context-only, tool-free question until the recipient is idle. |
 | `/mesh:requests [request-id]` | Inspect background requests, wait for a response, or cancel/dismiss local tracking. |
 

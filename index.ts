@@ -183,7 +183,7 @@ export default function (pi: ExtensionAPI) {
   let steerActive: Job | undefined;
   let steering = createSteeringCoordinator<Job>("exclusive");
   let steerGroup: Job[] = [];
-  let settings: MeshSettings = { joinByDefault: false, steeringMode: "exclusive", groupWindowMs: 500 };
+  let settings: MeshSettings = { joinByDefault: false, steeringMode: "exclusive", groupWindowMs: 500, batchWindowMs: 500 };
   let lastAnswer: Response | undefined;
   let terminalAnswer: Response | undefined;
   let steerCompaction: (OmCompaction & { jobId: string; settled: boolean; resumed: boolean; started: boolean; handoffTimer?: ReturnType<typeof setTimeout> }) | undefined;
@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI) {
     if (steerCompaction?.handoffTimer) clearTimeout(steerCompaction.handoffTimer);
     steerCompaction = undefined;
     if (listenerContext) void announce(listenerContext).catch(() => {});
-    try { pi.sendUserMessage(group.length === 1 ? header("steer", job.from, selfId, job.id, job.text) : multiRequestPrompt(group, selfId, "sender-group")); }
+    try { pi.sendUserMessage(group.length === 1 ? header("steer", job.from, selfId, job.id, job.text) : multiRequestPrompt(group, selfId, settings.steeringMode === "batch" ? "batch" : "sender-group")); }
     catch (error) {
       for (const request of group) finish(request, { status: "error", error: String(error) });
       steerActive = undefined;
@@ -447,7 +447,7 @@ export default function (pi: ExtensionAPI) {
       await chmod(path, 0o600);
     } catch (error) { next.close(); throw error; }
     settings = config;
-    steering = createSteeringCoordinator<Job>(config.steeringMode, config.groupWindowMs);
+    steering = createSteeringCoordinator<Job>(config.steeringMode, config.steeringMode === "batch" ? config.batchWindowMs : config.groupWindowMs);
     server = next;
     member = true;
     listenerId = id;
@@ -764,7 +764,7 @@ export default function (pi: ExtensionAPI) {
       name: `mesh_${kind}`,
       label: `${kind === "steer" ? "Steer" : "Ask BTW"} Pi session`,
       description: kind === "steer"
-        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer in exclusive mode, or queue it in FIFO or sender-group mode."
+        ? "Requires the caller to join with /mesh on. Send a lasting request to a local listening Pi session. Its conversation is changed. Blocking by default; delayed returns a request ID for mesh_wait. Busy listeners reject steer in exclusive mode, or queue it in FIFO, sender-group, or batch mode."
         : "Requires the caller to join with /mesh on. Ask a local listening Pi session a tool-free, context-only question without changing its conversation. Queues until idle. Blocking by default; delayed returns a request ID for mesh_wait.",
       parameters: Type.Object({ id: Type.String(), text: Type.String(), delayed: Type.Optional(Type.Boolean()) }),
       async execute(_callId, args, signal, _onUpdate, ctx) {

@@ -1,26 +1,27 @@
-export type SteeringMode = "exclusive" | "fifo" | "sender-group";
+export type SteeringMode = "exclusive" | "fifo" | "sender-group" | "batch";
 
 /** Admission and ordering for target-side steering requests; execution stays with Pi. */
-export function createSteeringCoordinator<T extends { from: string }>(mode: SteeringMode, groupWindowMs = 500) {
+export function createSteeringCoordinator<T extends { from: string }>(mode: SteeringMode, collectionWindowMs = 500) {
   const queued: T[] = [];
   let firstQueuedAt: number | undefined;
 
   return {
     mode,
     get queued() { return [...queued]; },
-    get readyInMs(): number { return mode === "sender-group" && firstQueuedAt !== undefined ? Math.max(0, firstQueuedAt + groupWindowMs - Date.now()) : 0; },
+    get readyInMs(): number { return (mode === "sender-group" || mode === "batch") && firstQueuedAt !== undefined ? Math.max(0, firstQueuedAt + collectionWindowMs - Date.now()) : 0; },
     admit(job: T, busy: boolean): "start" | "queued" | "rejected" {
-      if (mode !== "sender-group" && !busy && !queued.length) return "start";
+      if (mode !== "sender-group" && mode !== "batch" && !busy && !queued.length) return "start";
       if (mode === "exclusive") return "rejected";
       if (!queued.length) firstQueuedAt = Date.now();
       queued.push(job);
       return "queued";
     },
     nextBatch(): T[] {
-      if (!queued.length || (mode === "sender-group" && firstQueuedAt !== undefined && Date.now() < firstQueuedAt + groupWindowMs)) return [];
+      if (!queued.length || ((mode === "sender-group" || mode === "batch") && firstQueuedAt !== undefined && Date.now() < firstQueuedAt + collectionWindowMs)) return [];
       const first = queued.shift()!;
       const batch = [first];
-      if (mode === "sender-group") {
+      if (mode === "batch") batch.push(...queued.splice(0, 9));
+      else if (mode === "sender-group") {
         for (let i = 0; i < queued.length && batch.length < 10;) {
           if (queued[i].from === first.from) batch.push(queued.splice(i, 1)[0]);
           else i++;

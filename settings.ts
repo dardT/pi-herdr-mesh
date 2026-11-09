@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
 import type { SteeringMode } from "./steering.js";
 
-export type MeshSettings = { joinByDefault: boolean; steeringMode: SteeringMode; groupWindowMs: number };
+export type MeshSettings = { joinByDefault: boolean; steeringMode: SteeringMode; groupWindowMs: number; batchWindowMs: number };
 type PartialSettings = Partial<MeshSettings>;
 
 async function readSetting(path: string): Promise<PartialSettings | undefined> {
@@ -19,9 +19,12 @@ async function readSetting(path: string): Promise<PartialSettings | undefined> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Expected mesh settings object in ${path}`);
   const settings = value as Record<string, unknown>;
   if (settings.joinByDefault !== undefined && typeof settings.joinByDefault !== "boolean") throw new Error(`Expected boolean joinByDefault in ${path}`);
-  if (settings.steeringMode !== undefined && !["exclusive", "fifo", "sender-group"].includes(settings.steeringMode as string)) throw new Error(`Expected steeringMode to be "exclusive", "fifo", or "sender-group" in ${path}`);
-  if (settings.groupWindowMs !== undefined && (typeof settings.groupWindowMs !== "number" || !Number.isInteger(settings.groupWindowMs) || settings.groupWindowMs < 100 || settings.groupWindowMs > 10_000)) throw new Error(`Expected groupWindowMs to be an integer between 100 and 10000 in ${path}`);
-  return { joinByDefault: settings.joinByDefault as boolean | undefined, steeringMode: settings.steeringMode as SteeringMode | undefined, groupWindowMs: settings.groupWindowMs as number | undefined };
+  if (settings.steeringMode !== undefined && !["exclusive", "fifo", "sender-group", "batch"].includes(settings.steeringMode as string)) throw new Error(`Expected steeringMode to be "exclusive", "fifo", "sender-group", or "batch" in ${path}`);
+  for (const key of ["groupWindowMs", "batchWindowMs"] as const) {
+    const value = settings[key];
+    if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value < 100 || value > 10_000)) throw new Error(`Expected ${key} to be an integer between 100 and 10000 in ${path}`);
+  }
+  return { joinByDefault: settings.joinByDefault as boolean | undefined, steeringMode: settings.steeringMode as SteeringMode | undefined, groupWindowMs: settings.groupWindowMs as number | undefined, batchWindowMs: settings.batchWindowMs as number | undefined };
 }
 
 export async function meshSettings(cwd: string): Promise<MeshSettings> {
@@ -32,9 +35,10 @@ export async function meshSettings(cwd: string): Promise<MeshSettings> {
     settings.joinByDefault ??= current?.joinByDefault;
     settings.steeringMode ??= current?.steeringMode;
     settings.groupWindowMs ??= current?.groupWindowMs;
+    settings.batchWindowMs ??= current?.batchWindowMs;
     if (directory === parse(directory).root) break;
     directory = dirname(directory);
   }
   const global = await readSetting(join(homedir(), ".pi", "agent", "mesh", "settings.json"));
-  return { joinByDefault: settings.joinByDefault ?? global?.joinByDefault ?? false, steeringMode: settings.steeringMode ?? global?.steeringMode ?? "exclusive", groupWindowMs: settings.groupWindowMs ?? global?.groupWindowMs ?? 500 };
+  return { joinByDefault: settings.joinByDefault ?? global?.joinByDefault ?? false, steeringMode: settings.steeringMode ?? global?.steeringMode ?? "exclusive", groupWindowMs: settings.groupWindowMs ?? global?.groupWindowMs ?? 500, batchWindowMs: settings.batchWindowMs ?? global?.batchWindowMs ?? 500 };
 }
